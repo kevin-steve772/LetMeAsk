@@ -160,7 +160,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     }
 
     private String messagePrefix() {
-        String prefix = baseCfg == null ? "&6[Quiz]" : baseCfg.getString("messages.prefix", "&6[Quiz]");
+        String prefix = baseCfg == null ? "&6[教育部]" : baseCfg.getString("messages.prefix", "&6[教育部]");
         return prefix.replace('&', '§');
     }
 

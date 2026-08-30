@@ -19,4 +19,4 @@ fuzzy-similarity-threshold: 0.75
 
 # 消息前缀，支持 Bukkit 颜色代码（例如 &b[答题]）
 messages:
-  prefix: "&6[Quiz]"
+  prefix: "&6[教育部]"
