@@ -226,11 +226,11 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         String b = normalize(answer);
         if (a.isEmpty() || b.isEmpty()) return false;
         if (a.equalsIgnoreCase(b)) return true;
-        // Avoid accepting punctuation or unrelated text for short answers.
-        if (Math.min(a.length(), b.length()) < 3) return false;
         int dist = levenshtein(a, b);
         int max = Math.max(a.length(), b.length());
         double sim = 1.0 - (double) dist / (double) max;
+        // Permit one typo in short answers, but not an omitted or extra character.
+        if (dist == 1 && a.length() == b.length() && max >= 2) return true;
         return sim >= fuzzySimilarityThreshold || (dist <= 2 && max >= 4);
     }
 
