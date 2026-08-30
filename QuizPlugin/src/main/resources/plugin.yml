@@ -4,8 +4,10 @@ version: 1.0.0
 description: "在聊天栏出题的抢答活动插件（支持 Vault 经济，集成人机验证）"
 authors:
   - Generated
-depend: []
+depend:
+  - HumanVerify
 softdepend:
+  - CMI
   - Vault
 
 commands:

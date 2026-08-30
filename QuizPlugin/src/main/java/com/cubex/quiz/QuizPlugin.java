@@ -296,11 +296,11 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             // Try to call HumanVerifyApi as in provided snippet. This requires that the HumanVerify API
             // is available at compile/runtime. If you use a different package, add the dependency.
             try {
-                // 使用反射调用 HumanVerifyApi（避免在编译期依赖该 API）
+                // 使用反射调用 HumanVerifyApi，避免将第三方实现打进本插件。
                 Class<?> apiClass = Class.forName("com.codex.humanverify.api.HumanVerifyApi");
                 Object api = Bukkit.getServicesManager().load((Class) apiClass);
                 if (api != null) {
-                    Boolean isVerified = false;
+                        Boolean isVerified = false;
                     try {
                         isVerified = (Boolean) apiClass.getMethod("isVerified", org.bukkit.entity.Player.class).invoke(api, p);
                     } catch (NoSuchMethodException ignored) {
@@ -336,6 +336,11 @@ public class QuizPlugin extends JavaPlugin implements Listener {
 
                                 if (ok) {
                                     Bukkit.getScheduler().runTask(this, () -> {
+                                        if (!p.isOnline()) {
+                                            verifying = false;
+                                            currentQuestion = null;
+                                            return;
+                                        }
                                         verifying = false;
                                         awardWinner(p);
                                         currentQuestion = null;
@@ -357,27 +362,22 @@ public class QuizPlugin extends JavaPlugin implements Listener {
                             }
                         });
                     } else {
-                        getLogger().warning("HumanVerifyApi.requestVerification 未返回 CompletableFuture 或返回 null，跳过验证并直接发放奖励");
+                        getLogger().warning("HumanVerifyApi.requestVerification 未返回 CompletableFuture 或返回 null，验证失败，不发放奖励");
                         verifying = false;
-                        awardWinner(p);
                         currentQuestion = null;
                     }
                 } else {
-                    getLogger().warning("未能通过 ServicesManager 加载 HumanVerifyApi，跳过验证并直接判定为成功（请检查 API 配置）。");
+                    getLogger().warning("未能通过 ServicesManager 加载 HumanVerifyApi，验证失败，不发放奖励。");
                     verifying = false;
-                    awardWinner(player);
                     currentQuestion = null;
                 }
             } catch (ClassNotFoundException cnf) {
-                // HumanVerifyApi not available at runtime — try best-effort: warn and award
-                getLogger().warning("HumanVerifyApi 类未找到，无法执行人机验证。请在构建路径/运行服中添加该 API。将直接发放奖励。");
+                getLogger().warning("HumanVerifyApi 类未找到，无法执行人机验证。请确认 HumanVerify 已安装并先于本插件加载。");
                 verifying = false;
-                awardWinner(player);
                 currentQuestion = null;
             } catch (Throwable t) {
-                getLogger().log(Level.SEVERE, "调用人机验证 API 时出错，直接发放奖励（以避免影响玩家体验）", t);
+                getLogger().log(Level.SEVERE, "调用人机验证 API 时出错，验证失败，不发放奖励", t);
                 verifying = false;
-                awardWinner(player);
                 currentQuestion = null;
             }
 
@@ -421,9 +421,6 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     }
 
     private boolean setupEconomy() {
-        if (getServer().getPluginManager().getPlugin("Vault") == null) {
-            return false;
-        }
         try {
             Class<?> econClass = Class.forName("net.milkbowl.vault.economy.Economy");
             // get registration via ServicesManager.getRegistration(Class)
@@ -446,42 +443,45 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     // Reflection helpers for interacting with economy provider without compile-time Vault dependency
     private double getBalanceOf(String who) {
         if (econ == null) return 0.0;
-        try {
-            // Prefer OfflinePlayer overload if available and we have an OfflinePlayer
-            if (payerOffline != null) {
-                try {
-                    Method m = econ.getClass().getMethod("getBalance", org.bukkit.OfflinePlayer.class);
-                    Object r = m.invoke(econ, payerOffline);
-                    if (r instanceof Number) return ((Number) r).doubleValue();
-                } catch (NoSuchMethodException ignored) {}
-            }
-            // fallback to String
+        if (payerIsServer) {
+            Double balance = extractBalance(invokeEconomy("bankBalance", new Class<?>[]{String.class}, who));
+            if (balance != null) return balance;
+        }
+        if (payerOffline != null) {
             try {
-                Method m = econ.getClass().getMethod("getBalance", String.class);
-                Object r = m.invoke(econ, who);
-                if (r instanceof Number) return ((Number) r).doubleValue();
-            } catch (NoSuchMethodException ignored) {}
+                Object response = invokeEconomy("getBalance", new Class<?>[]{org.bukkit.OfflinePlayer.class}, payerOffline);
+                if (response instanceof Number) return ((Number) response).doubleValue();
+            } catch (Throwable t) {
+                getLogger().fine("CMI OfflinePlayer 余额查询失败，回退到账户名: " + t.getMessage());
+            }
+        }
+        try {
+            Object response = invokeEconomy("getBalance", new Class<?>[]{String.class}, who);
+            if (response instanceof Number) return ((Number) response).doubleValue();
         } catch (Throwable t) {
-            getLogger().log(Level.WARNING, "查询余额时出错", t);
+            getLogger().log(Level.WARNING, "查询账户 " + who + " 余额时出错", t);
         }
         return 0.0;
     }
 
     private Object withdrawFrom(String who, double amount) {
         if (econ == null) return null;
-        try {
-            if (payerOffline != null) {
-                try {
-                    Method m = econ.getClass().getMethod("withdrawPlayer", org.bukkit.OfflinePlayer.class, double.class);
-                    return m.invoke(econ, payerOffline, amount);
-                } catch (NoSuchMethodException ignored) {}
-            }
+        if (payerIsServer) {
+            Object response = invokeEconomy("bankWithdraw", new Class<?>[]{String.class, double.class}, who, amount);
+            if (response != null) return response;
+        }
+        if (payerOffline != null) {
             try {
-                Method m = econ.getClass().getMethod("withdrawPlayer", String.class, double.class);
-                return m.invoke(econ, who, amount);
-            } catch (NoSuchMethodException ignored) {}
+                Object response = invokeEconomy("withdrawPlayer", new Class<?>[]{org.bukkit.OfflinePlayer.class, double.class}, payerOffline, amount);
+                if (response != null) return response;
+            } catch (Throwable t) {
+                getLogger().fine("CMI OfflinePlayer 扣款失败，回退到账户名: " + t.getMessage());
+            }
+        }
+        try {
+            return invokeEconomy("withdrawPlayer", new Class<?>[]{String.class, double.class}, who, amount);
         } catch (Throwable t) {
-            getLogger().log(Level.WARNING, "从账户扣款时出错", t);
+            getLogger().log(Level.WARNING, "从账户 " + who + " 扣款时出错", t);
         }
         return null;
     }
@@ -489,19 +489,54 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     private Object depositTo(String who, double amount) {
         if (econ == null) return null;
         try {
+            if (payerIsServer && who.equals(payerDisplay)) {
+                Object bankResponse = invokeEconomy("bankDeposit", new Class<?>[]{String.class, double.class}, who, amount);
+                if (bankResponse != null) return bankResponse;
+            }
             if (who != null && payerOffline != null && payerOffline.getName() != null && payerOffline.getName().equals(who)) {
                 // deposit to offline payer
                 try {
-                    Method m = econ.getClass().getMethod("depositPlayer", org.bukkit.OfflinePlayer.class, double.class);
-                    return m.invoke(econ, payerOffline, amount);
-                } catch (NoSuchMethodException ignored) {}
+                    Object response = invokeEconomy("depositPlayer", new Class<?>[]{org.bukkit.OfflinePlayer.class, double.class}, payerOffline, amount);
+                    if (response != null) return response;
+                } catch (Throwable ignored) {}
             }
             try {
-                Method m = econ.getClass().getMethod("depositPlayer", String.class, double.class);
-                return m.invoke(econ, who, amount);
-            } catch (NoSuchMethodException ignored) {}
+                Object response = invokeEconomy("depositPlayer", new Class<?>[]{String.class, double.class}, who, amount);
+                if (response != null) return response;
+            } catch (Throwable ignored) {}
         } catch (Throwable t) {
             getLogger().log(Level.WARNING, "给账户充值时出错", t);
+        }
+        return null;
+    }
+
+    private Object invokeEconomy(String methodName, Class<?>[] parameterTypes, Object... arguments) {
+        try {
+            Class<?> economyInterface = Class.forName("net.milkbowl.vault.economy.Economy");
+            return economyInterface.getMethod(methodName, parameterTypes).invoke(econ, arguments);
+        } catch (NoSuchMethodException ignored) {
+            return null;
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "调用经济方法 " + methodName + " 时出错", t);
+            return null;
+        }
+    }
+
+    private Double extractBalance(Object response) {
+        if (response instanceof Number) return ((Number) response).doubleValue();
+        if (response == null) return null;
+        try {
+            try {
+                Method method = response.getClass().getMethod("getBalance");
+                Object value = method.invoke(response);
+                if (value instanceof Number) return ((Number) value).doubleValue();
+            } catch (NoSuchMethodException ignored) {
+                java.lang.reflect.Field field = response.getClass().getField("balance");
+                Object value = field.get(response);
+                if (value instanceof Number) return ((Number) value).doubleValue();
+            }
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "读取经济余额响应时出错", t);
         }
         return null;
     }
