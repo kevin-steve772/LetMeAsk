@@ -13,4 +13,10 @@ payer: Server
 reward: 50.0
 question-interval-seconds: 60
 anti-bot-threshold-seconds: 1
+# 同一玩家连续答对达到此次数时触发人机验证；设置为 0 可禁用此条件
+anti-bot-correct-answer-threshold: 3
 fuzzy-similarity-threshold: 0.75
+
+# 消息前缀，支持 Bukkit 颜色代码（例如 &b[答题]）
+messages:
+  prefix: "&6[Quiz]"
