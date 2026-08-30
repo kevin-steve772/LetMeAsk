@@ -1,0 +1,610 @@
+package com.cubex.quiz;
+
+import org.bukkit.Bukkit;
+import org.bukkit.OfflinePlayer;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandExecutor;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.AsyncPlayerChatEvent;
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.scheduler.BukkitTask;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
+
+import java.io.File;
+import java.lang.reflect.Method;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.logging.Level;
+
+/**
+ * Quiz activity plugin (CubeX-compatible layout).
+ * - Uses Vault for economy (recommended: CMI exposes Vault provider)
+ * - Integrates with external HumanVerifyApi as in your example. If you have a different package
+ *   for HumanVerifyApi, add the API dependency when compiling. If compilation fails, adjust imports
+ *   to the correct package for your HumanVerify plugin.
+ */
+public class QuizPlugin extends JavaPlugin implements Listener {
+    // Vault economy provider (kept as Object to avoid compile-time dependency on Vault API)
+    private Object econ; // provider instance
+
+    private final Random random = new Random();
+
+    // runtime state
+    private volatile Question currentQuestion = null;
+    private volatile boolean paused = false; // paused due to payer insufficient funds
+    private volatile boolean verifying = false; // question locked while human verification pending
+
+    // config values
+    private String payerName;
+    private double rewardAmount;
+    private long questionIntervalSeconds;
+    private int antiBotThresholdSeconds;
+    private double fuzzySimilarityThreshold = 0.75; // default similarity threshold (0-1)
+
+    // resolved payer information (support UUID / OfflinePlayer / Server / LittleSkin via prefix)
+    private org.bukkit.OfflinePlayer payerOffline = null;
+    private boolean payerIsServer = false;
+    private String payerDisplay = null; // human readable identifier
+
+    // config files
+    private File baseFile;
+    private File questionsFile;
+    private FileConfiguration baseCfg;
+    private FileConfiguration questionsCfg;
+
+    // scheduler handle
+    private BukkitTask tickerTask;
+
+    @Override
+    public void onEnable() {
+        // Ensure default resource files exist
+        saveResource("base.yml", false);
+        saveResource("questions.yml", false);
+
+        // load configuration files
+        loadConfigValues();
+
+        if (!setupEconomy()) {
+            getLogger().severe("Vault economy not found — plugin will continue to load, but all payout logic is disabled until Vault is installed");
+        }
+
+        getServer().getPluginManager().registerEvents(this, this);
+
+        // register command
+        if (getCommand("letmeask") != null) getCommand("letmeask").setExecutor(new QuizCommand());
+
+        // Start scheduler to post questions periodically (also checks paused state)
+        startTask();
+
+        getLogger().info("QuizPlugin enabled");
+    }
+
+    @Override
+    public void onDisable() {
+        stopTask();
+        getLogger().info("QuizPlugin disabled");
+    }
+
+    private void loadConfigValues() {
+        // load base and questions from their own files
+        baseFile = new File(getDataFolder(), "base.yml");
+        questionsFile = new File(getDataFolder(), "questions.yml");
+        try {
+            if (!baseFile.exists()) saveResource("base.yml", false);
+            if (!questionsFile.exists()) saveResource("questions.yml", false);
+        } catch (Exception ignored) {}
+
+        baseCfg = YamlConfiguration.loadConfiguration(baseFile);
+        questionsCfg = YamlConfiguration.loadConfiguration(questionsFile);
+
+        payerName = baseCfg.getString("payer", "Server");
+        rewardAmount = baseCfg.getDouble("reward", 50.0);
+        questionIntervalSeconds = baseCfg.getLong("question-interval-seconds", 60L);
+        antiBotThresholdSeconds = baseCfg.getInt("anti-bot-threshold-seconds", 1);
+        fuzzySimilarityThreshold = baseCfg.getDouble("fuzzy-similarity-threshold", fuzzySimilarityThreshold);
+
+        // resolve payer to a stable identifier (UUID/name/Server/LittleSkin)
+        resolvePayer(payerName);
+
+        List<String> raw = questionsCfg.getStringList("questions");
+        if (raw == null || raw.isEmpty()) {
+            raw = Arrays.asList(
+                    "中国首都=北京",
+                    "2+2=4",
+                    "香蕉是什么颜色=黄色"
+            );
+            getLogger().warning("questions.yml 中没有题目，使用内置示例题目。请在 questions.yml 中配置 questions 字段（格式：题目=答案）");
+        }
+
+        questions.clear();
+        for (String line : raw) {
+            String[] parts = line.split("=", 2);
+            if (parts.length < 2) parts = line.split(":", 2);
+            if (parts.length >= 2) {
+                questions.add(new Question(parts[0].trim(), parts[1].trim()));
+            }
+        }
+
+        if (questions.isEmpty()) {
+            getLogger().severe("没有可用题目，插件无法正常出题。请在 questions.yml 中添加题目。禁用插件。");
+            getServer().getPluginManager().disablePlugin(this);
+        }
+    }
+
+    private void startTask() {
+        stopTask();
+        tickerTask = new BukkitRunnable() {
+            @Override
+            public void run() {
+                try {
+                    tick();
+                } catch (Throwable t) {
+                    getLogger().log(Level.SEVERE, "Error in quiz tick", t);
+                }
+            }
+        }.runTaskTimer(this, 20L, Math.max(1L, questionIntervalSeconds) * 20L);
+    }
+
+    private void resolvePayer(String payer) {
+        payerOffline = null;
+        payerIsServer = false;
+        payerDisplay = payer;
+        if (payer == null) return;
+        if (payer.equalsIgnoreCase("server") || payer.equalsIgnoreCase("console")) {
+            payerIsServer = true;
+            payerDisplay = payer;
+            return;
+        }
+        // support littleskin:uuid or littleskin:name
+        if (payer.toLowerCase().startsWith("littleskin:")) {
+            String v = payer.substring(payer.indexOf(":") + 1);
+            try {
+                java.util.UUID uuid = java.util.UUID.fromString(v);
+                payerOffline = Bukkit.getOfflinePlayer(uuid);
+                payerDisplay = uuid.toString();
+                return;
+            } catch (IllegalArgumentException ignored) {
+                // fall through to name
+            }
+            payerOffline = Bukkit.getOfflinePlayer(v);
+            payerDisplay = payerOffline.getName() != null ? payerOffline.getName() : v;
+            return;
+        }
+        // try UUID
+        try {
+            java.util.UUID uuid = java.util.UUID.fromString(payer);
+            payerOffline = Bukkit.getOfflinePlayer(uuid);
+            payerDisplay = uuid.toString();
+            return;
+        } catch (IllegalArgumentException ignored) {
+        }
+        // fallback to name
+        payerOffline = Bukkit.getOfflinePlayer(payer);
+        payerDisplay = payerOffline.getName() != null ? payerOffline.getName() : payer;
+    }
+
+    private void stopTask() {
+        if (tickerTask != null && !tickerTask.isCancelled()) {
+            tickerTask.cancel();
+            tickerTask = null;
+        }
+    }
+
+    private boolean postNewQuestion(boolean force) {
+        if (!force && (currentQuestion != null || verifying || paused)) return false;
+        Question q = questions.get(random.nextInt(questions.size()));
+        currentQuestion = q;
+        currentQuestion.postTime = System.currentTimeMillis();
+        Bukkit.broadcastMessage("§6[Quiz] 新题目: §f" + q.question + " §6（在聊天中直接回答抢答）");
+        return true;
+    }
+
+    private boolean matches(String provided, String answer) {
+        if (provided == null || answer == null) return false;
+        String a = normalize(provided);
+        String b = normalize(answer);
+        if (a.equalsIgnoreCase(b)) return true;
+        int dist = levenshtein(a, b);
+        int max = Math.max(a.length(), b.length());
+        if (max == 0) return true;
+        double sim = 1.0 - (double) dist / (double) max;
+        return sim >= fuzzySimilarityThreshold || dist <= 2;
+    }
+
+    private String normalize(String s) {
+        return s == null ? "" : s.replaceAll("[^\\p{L}\\p{N}]+", "").toLowerCase();
+    }
+
+    private int levenshtein(String s1, String s2) {
+        int[] prev = new int[s2.length() + 1];
+        int[] curr = new int[s2.length() + 1];
+        for (int j = 0; j <= s2.length(); j++) prev[j] = j;
+        for (int i = 1; i <= s1.length(); i++) {
+            curr[0] = i;
+            for (int j = 1; j <= s2.length(); j++) {
+                int cost = s1.charAt(i - 1) == s2.charAt(j - 1) ? 0 : 1;
+                curr[j] = Math.min(Math.min(curr[j - 1] + 1, prev[j] + 1), prev[j - 1] + cost);
+            }
+            System.arraycopy(curr, 0, prev, 0, prev.length);
+        }
+        return prev[s2.length()];
+    }
+
+    private final List<Question> questions = new ArrayList<>();
+
+    private void tick() {
+        // If paused, check payer balance; resume when enough funds
+        if (paused) {
+            double bal = getBalanceOf(payerDisplay);
+            if (bal >= rewardAmount) {
+                paused = false;
+                Bukkit.broadcastMessage("§a[Quiz] 缴费玩家资金已足额，恢复出题。当前余额: " + bal);
+            } else {
+                // still paused
+                return;
+            }
+        }
+
+        // If a question is active or verifying is in progress, skip
+        if (currentQuestion != null || verifying) return;
+
+        // Post a new question
+        Question q = questions.get(random.nextInt(questions.size()));
+        currentQuestion = q;
+        currentQuestion.postTime = System.currentTimeMillis();
+
+        Bukkit.broadcastMessage("§6[Quiz] 新题目: §f" + q.question + " §6（在聊天中直接回答抢答）");
+    }
+
+    @EventHandler
+    public void onPlayerChat(AsyncPlayerChatEvent event) {
+        if (currentQuestion == null || verifying) return;
+
+        String msg = event.getMessage().trim();
+        Player player = event.getPlayer();
+
+        if (matches(msg, currentQuestion.answer)) {
+            // Mark answered synchronously to avoid race — switch to main thread
+            event.setCancelled(false);
+            // Handle on main thread
+            Bukkit.getScheduler().runTask(this, () -> handleCorrectAnswer(player));
+        }
+    }
+
+    private synchronized void handleCorrectAnswer(Player player) {
+        if (currentQuestion == null || verifying) return; // double-check
+
+        long now = System.currentTimeMillis();
+        long deltaSecs = (now - currentQuestion.postTime) / 1000L;
+
+        // If answered too fast, invoke human verification
+        if (deltaSecs <= antiBotThresholdSeconds) {
+            verifying = true;
+            Player p = player;
+            Bukkit.broadcastMessage("§c[Quiz] 玩家 §f" + p.getName() + " §c答题速度异常，需要进行人机验证...");
+
+            // Try to call HumanVerifyApi as in provided snippet. This requires that the HumanVerify API
+            // is available at compile/runtime. If you use a different package, add the dependency.
+            try {
+                // 使用反射调用 HumanVerifyApi（避免在编译期依赖该 API）
+                Class<?> apiClass = Class.forName("com.codex.humanverify.api.HumanVerifyApi");
+                Object api = Bukkit.getServicesManager().load((Class) apiClass);
+                if (api != null) {
+                    Boolean isVerified = false;
+                    try {
+                        isVerified = (Boolean) apiClass.getMethod("isVerified", org.bukkit.entity.Player.class).invoke(api, p);
+                    } catch (NoSuchMethodException ignored) {
+                        // method not available
+                    }
+                    if (Boolean.TRUE.equals(isVerified)) {
+                        verifying = false;
+                        awardWinner(p);
+                        currentQuestion = null;
+                        return;
+                    }
+
+                    Object future = null;
+                    try {
+                        future = apiClass.getMethod("requestVerification", org.bukkit.entity.Player.class).invoke(api, p);
+                    } catch (NoSuchMethodException nsme) {
+                        getLogger().warning("HumanVerifyApi 没有 requestVerification(Player) 方法，跳过验证。");
+                    }
+
+                    if (future instanceof java.util.concurrent.CompletableFuture) {
+                        ((java.util.concurrent.CompletableFuture<?>) future).thenAccept(result -> {
+                            try {
+                                // 通过比较枚举名称判断是否为 SUCCESS
+                                boolean ok = false;
+                                try {
+                                    java.lang.reflect.Method nameM = result.getClass().getMethod("name");
+                                    String nm = (String) nameM.invoke(result);
+                                    ok = "SUCCESS".equals(nm);
+                                } catch (Exception e) {
+                                    // fallback to toString
+                                    ok = "SUCCESS".equals(result.toString());
+                                }
+
+                                if (ok) {
+                                    Bukkit.getScheduler().runTask(this, () -> {
+                                        verifying = false;
+                                        awardWinner(p);
+                                        currentQuestion = null;
+                                    });
+                                } else {
+                                    Bukkit.getScheduler().runTask(this, () -> {
+                                        verifying = false;
+                                        currentQuestion = null;
+                                        Bukkit.broadcastMessage("§c[Quiz] 玩家 §f" + p.getName() + " §c未通过人机验证，已被踢出服务器。");
+                                        p.kickPlayer("未通过人机验证");
+                                    });
+                                }
+                            } catch (Throwable t) {
+                                getLogger().log(Level.SEVERE, "处理人机验证结果时出错", t);
+                                Bukkit.getScheduler().runTask(this, () -> {
+                                    verifying = false;
+                                    currentQuestion = null;
+                                });
+                            }
+                        });
+                    } else {
+                        getLogger().warning("HumanVerifyApi.requestVerification 未返回 CompletableFuture 或返回 null，跳过验证并直接发放奖励");
+                        verifying = false;
+                        awardWinner(p);
+                        currentQuestion = null;
+                    }
+                } else {
+                    getLogger().warning("未能通过 ServicesManager 加载 HumanVerifyApi，跳过验证并直接判定为成功（请检查 API 配置）。");
+                    verifying = false;
+                    awardWinner(player);
+                    currentQuestion = null;
+                }
+            } catch (ClassNotFoundException cnf) {
+                // HumanVerifyApi not available at runtime — try best-effort: warn and award
+                getLogger().warning("HumanVerifyApi 类未找到，无法执行人机验证。请在构建路径/运行服中添加该 API。将直接发放奖励。");
+                verifying = false;
+                awardWinner(player);
+                currentQuestion = null;
+            } catch (Throwable t) {
+                getLogger().log(Level.SEVERE, "调用人机验证 API 时出错，直接发放奖励（以避免影响玩家体验）", t);
+                verifying = false;
+                awardWinner(player);
+                currentQuestion = null;
+            }
+
+            return;
+        }
+
+        // Normal awarding
+        awardWinner(player);
+        currentQuestion = null;
+    }
+
+    private void awardWinner(Player winner) {
+        // Check payer balance
+        double payerBal = getBalanceOf(payerDisplay);
+        if (payerBal < rewardAmount) {
+            paused = true;
+            Bukkit.broadcastMessage("§c[Quiz] 出题已暂停：缴费玩家 §f" + payerDisplay + " §c余额不足（需要 " + rewardAmount + "，当前 " + payerBal + "）。");
+            return;
+        }
+
+        Object w = withdrawFrom(payerDisplay, rewardAmount);
+        if (!isEconomyResponseSuccess(w)) {
+            paused = true;
+            String err = getEconomyResponseError(w);
+            Bukkit.broadcastMessage("§c[Quiz] 从缴费玩家扣款失败（错误: " + err + "），出题已暂停。请检查服务器日志。" );
+            getLogger().warning("扣款失败: " + err);
+            return;
+        }
+
+        Object d = depositTo(winner.getName(), rewardAmount);
+        if (!isEconomyResponseSuccess(d)) {
+            // refund payer if possible
+            String err = getEconomyResponseError(d);
+            getLogger().warning("发放给胜利玩家失败: " + err + "。尝试退款给缴费玩家。");
+            depositTo(payerDisplay, rewardAmount);
+            Bukkit.broadcastMessage("§c[Quiz] 发放奖励失败，已退款给缴费玩家，请联系管理员。错误: " + err);
+            return;
+        }
+
+        Bukkit.broadcastMessage("§a[Quiz] 玩家 §f" + winner.getName() + " §a答对了问题，获得 §e" + rewardAmount + " §a货币！来源: §f" + payerName);
+    }
+
+    private boolean setupEconomy() {
+        if (getServer().getPluginManager().getPlugin("Vault") == null) {
+            return false;
+        }
+        try {
+            Class<?> econClass = Class.forName("net.milkbowl.vault.economy.Economy");
+            // get registration via ServicesManager.getRegistration(Class)
+            Object rsp = getServer().getServicesManager().getRegistration((Class) econClass);
+            if (rsp == null) return false;
+            // RegisteredServiceProvider has method getProvider()
+            Method getProvider = rsp.getClass().getMethod("getProvider");
+            Object provider = getProvider.invoke(rsp);
+            this.econ = provider;
+            return this.econ != null;
+        } catch (ClassNotFoundException cnf) {
+            getLogger().warning("Vault API 不在类路径中，无法加载 Economy 接口");
+            return false;
+        } catch (Throwable t) {
+            getLogger().log(Level.SEVERE, "加载经济提供者时出错", t);
+            return false;
+        }
+    }
+
+    // Reflection helpers for interacting with economy provider without compile-time Vault dependency
+    private double getBalanceOf(String who) {
+        if (econ == null) return 0.0;
+        try {
+            // Prefer OfflinePlayer overload if available and we have an OfflinePlayer
+            if (payerOffline != null) {
+                try {
+                    Method m = econ.getClass().getMethod("getBalance", org.bukkit.OfflinePlayer.class);
+                    Object r = m.invoke(econ, payerOffline);
+                    if (r instanceof Number) return ((Number) r).doubleValue();
+                } catch (NoSuchMethodException ignored) {}
+            }
+            // fallback to String
+            try {
+                Method m = econ.getClass().getMethod("getBalance", String.class);
+                Object r = m.invoke(econ, who);
+                if (r instanceof Number) return ((Number) r).doubleValue();
+            } catch (NoSuchMethodException ignored) {}
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "查询余额时出错", t);
+        }
+        return 0.0;
+    }
+
+    private Object withdrawFrom(String who, double amount) {
+        if (econ == null) return null;
+        try {
+            if (payerOffline != null) {
+                try {
+                    Method m = econ.getClass().getMethod("withdrawPlayer", org.bukkit.OfflinePlayer.class, double.class);
+                    return m.invoke(econ, payerOffline, amount);
+                } catch (NoSuchMethodException ignored) {}
+            }
+            try {
+                Method m = econ.getClass().getMethod("withdrawPlayer", String.class, double.class);
+                return m.invoke(econ, who, amount);
+            } catch (NoSuchMethodException ignored) {}
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "从账户扣款时出错", t);
+        }
+        return null;
+    }
+
+    private Object depositTo(String who, double amount) {
+        if (econ == null) return null;
+        try {
+            if (who != null && payerOffline != null && payerOffline.getName() != null && payerOffline.getName().equals(who)) {
+                // deposit to offline payer
+                try {
+                    Method m = econ.getClass().getMethod("depositPlayer", org.bukkit.OfflinePlayer.class, double.class);
+                    return m.invoke(econ, payerOffline, amount);
+                } catch (NoSuchMethodException ignored) {}
+            }
+            try {
+                Method m = econ.getClass().getMethod("depositPlayer", String.class, double.class);
+                return m.invoke(econ, who, amount);
+            } catch (NoSuchMethodException ignored) {}
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "给账户充值时出错", t);
+        }
+        return null;
+    }
+
+    private boolean isEconomyResponseSuccess(Object resp) {
+        if (resp == null) return false;
+        try {
+            // try transactionSuccess() method
+            try {
+                Method m = resp.getClass().getMethod("transactionSuccess");
+                Object r = m.invoke(resp);
+                if (r instanceof Boolean) return (Boolean) r;
+            } catch (NoSuchMethodException ignored) {}
+            // try success field
+            try {
+                java.lang.reflect.Field f = resp.getClass().getField("success");
+                Object r = f.get(resp);
+                if (r instanceof Boolean) return (Boolean) r;
+            } catch (NoSuchFieldException ignored) {}
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "检查经济响应时出错", t);
+        }
+        return false;
+    }
+
+    private String getEconomyResponseError(Object resp) {
+        if (resp == null) return "null_response";
+        try {
+            // try errorMessage field
+            try {
+                java.lang.reflect.Field f = resp.getClass().getField("errorMessage");
+                Object r = f.get(resp);
+                if (r != null) return r.toString();
+            } catch (NoSuchFieldException ignored) {}
+            // try getErrorMessage() method
+            try {
+                Method m = resp.getClass().getMethod("getErrorMessage");
+                Object r = m.invoke(resp);
+                if (r != null) return r.toString();
+            } catch (NoSuchMethodException ignored) {}
+            // try toString()
+            return resp.toString();
+        } catch (Throwable t) {
+            getLogger().log(Level.WARNING, "读取经济响应错误信息时出错", t);
+            return "error_read_failed";
+        }
+    }
+
+    // Command handler
+    private class QuizCommand implements CommandExecutor {
+        @Override
+        public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+            if (!sender.hasPermission("letmeask.admin")) {
+                sender.sendMessage("§c你没有权限执行此命令 (letmeask.admin)");
+                return true;
+            }
+            if (args.length == 0) {
+                sender.sendMessage("§6LetMeAsk 指令： /letmeask start|stop|question [force]|reload|status");
+                return true;
+            }
+            String sub = args[0].toLowerCase();
+            switch (sub) {
+                case "start":
+                    startTask();
+                    sender.sendMessage("§a已启动定时出题");
+                    return true;
+                case "stop":
+                    stopTask();
+                    sender.sendMessage("§c已停止定时出题");
+                    return true;
+                case "question":
+                case "q": {
+                    boolean force = args.length > 1 && args[1].equalsIgnoreCase("force");
+                    boolean ok = postNewQuestion(force);
+                    if (ok) sender.sendMessage("§a已发布新题目");
+                    else sender.sendMessage("§c无法发布新题目（已有题目/正在验证/已暂停）。使用 /letmeask question force 可强制发布");
+                    return true;
+                }
+                case "reload":
+                    loadConfigValues();
+                    // restart scheduler to pick up interval changes
+                    startTask();
+                    sender.sendMessage("§a已重载配置(base.yml 与 questions.yml)");
+                    return true;
+                case "status":
+                    sender.sendMessage("§6LetMeAsk 状态:");
+                    sender.sendMessage(" 自动出题: " + (tickerTask != null ? "§a运行中" : "§c已停止"));
+                    sender.sendMessage(" 当前题目: " + (currentQuestion != null ? currentQuestion.question : "无"));
+                    sender.sendMessage(" 暂停(余额不足): " + (paused ? "§c是" : "§a否"));
+                    sender.sendMessage(" 人机验证锁定: " + (verifying ? "§c是" : "§a否"));
+                    sender.sendMessage(" 支付玩家: §f" + payerDisplay + " §7(余额: " + String.format("%.2f", getBalanceOf(payerDisplay)) + ")");
+                    return true;
+                default:
+                    sender.sendMessage("§c未知子命令: " + sub);
+                    return true;
+            }
+        }
+    }
+
+    // Simple question holder
+    private static class Question {
+        final String question;
+        final String answer;
+        volatile long postTime;
+
+        Question(String q, String a) {
+            this.question = q;
+            this.answer = a;
+        }
+    }
+}
