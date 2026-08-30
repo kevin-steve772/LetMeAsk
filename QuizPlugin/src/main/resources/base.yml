@@ -1,9 +1,9 @@
 # LetMeAsk 基础配置
-# payer: 扣款账户名（必须与 Vault 经济插件中的账户名一致）
+# payer: 扣款玩家标识（支持玩家名或 UUID）
 #   - 玩家名（例如: Kevin）
 #   - UUID（例如: 123e4567-e89b-12d3-a456-426614174000）
 #   - littleskin:<uuid> 或 littleskin:<name>（如果你使用 LittleSkin 或类似插件）
-#   - Server 或 Console 表示使用名为 Server/Console 的 Vault 银行账户；这不是控制台钱包
+#   - Server 或 Console 表示由服务器出资（仅当经济插件支持该账户名时可用）
 # reward: 每题奖励金额
 # question-interval-seconds: 自动出题间隔（秒）
 # anti-bot-threshold-seconds: 回答速度（秒）小于等于该值会触发人机验证

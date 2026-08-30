@@ -50,6 +50,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     // resolved payer information (support UUID / OfflinePlayer / Server / LittleSkin via prefix)
     private org.bukkit.OfflinePlayer payerOffline = null;
     private boolean payerIsServer = false;
+    private boolean payerUsesUuid = false;
     private String payerDisplay = null; // human readable identifier
 
     // config files
@@ -158,6 +159,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     private void resolvePayer(String payer) {
         payerOffline = null;
         payerIsServer = false;
+        payerUsesUuid = false;
         payerDisplay = payer;
         if (payer == null) return;
         if (payer.equalsIgnoreCase("server") || payer.equalsIgnoreCase("console")) {
@@ -184,6 +186,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         try {
             java.util.UUID uuid = java.util.UUID.fromString(payer);
             payerOffline = Bukkit.getOfflinePlayer(uuid);
+            payerUsesUuid = true;
             payerDisplay = uuid.toString();
             return;
         } catch (IllegalArgumentException ignored) {
@@ -443,11 +446,11 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     // Reflection helpers for interacting with economy provider without compile-time Vault dependency
     private double getBalanceOf(String who) {
         if (econ == null) return 0.0;
-        if (payerIsServer) {
+            if (payerIsServer) {
             Double balance = extractBalance(invokeEconomy("bankBalance", new Class<?>[]{String.class}, who));
             if (balance != null) return balance;
         }
-        if (payerOffline != null) {
+        if (payerUsesUuid && payerOffline != null) {
             try {
                 Object response = invokeEconomy("getBalance", new Class<?>[]{org.bukkit.OfflinePlayer.class}, payerOffline);
                 if (response instanceof Number) return ((Number) response).doubleValue();
@@ -461,6 +464,10 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         } catch (Throwable t) {
             getLogger().log(Level.WARNING, "查询账户 " + who + " 余额时出错", t);
         }
+        if (payerOffline != null) {
+            Object response = invokeEconomy("getBalance", new Class<?>[]{org.bukkit.OfflinePlayer.class}, payerOffline);
+            if (response instanceof Number) return ((Number) response).doubleValue();
+        }
         return 0.0;
     }
 
@@ -470,7 +477,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             Object response = invokeEconomy("bankWithdraw", new Class<?>[]{String.class, double.class}, who, amount);
             if (response != null) return response;
         }
-        if (payerOffline != null) {
+        if (payerUsesUuid && payerOffline != null) {
             try {
                 Object response = invokeEconomy("withdrawPlayer", new Class<?>[]{org.bukkit.OfflinePlayer.class, double.class}, payerOffline, amount);
                 if (response != null) return response;
@@ -479,9 +486,14 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             }
         }
         try {
-            return invokeEconomy("withdrawPlayer", new Class<?>[]{String.class, double.class}, who, amount);
+            Object response = invokeEconomy("withdrawPlayer", new Class<?>[]{String.class, double.class}, who, amount);
+            if (response != null) return response;
         } catch (Throwable t) {
             getLogger().log(Level.WARNING, "从账户 " + who + " 扣款时出错", t);
+        }
+        if (payerOffline != null) {
+            Object response = invokeEconomy("withdrawPlayer", new Class<?>[]{org.bukkit.OfflinePlayer.class, double.class}, payerOffline, amount);
+            if (response != null) return response;
         }
         return null;
     }
@@ -493,7 +505,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
                 Object bankResponse = invokeEconomy("bankDeposit", new Class<?>[]{String.class, double.class}, who, amount);
                 if (bankResponse != null) return bankResponse;
             }
-            if (who != null && payerOffline != null && payerOffline.getName() != null && payerOffline.getName().equals(who)) {
+            if (payerUsesUuid && who != null && payerOffline != null && payerOffline.getName() != null && payerOffline.getName().equals(who)) {
                 // deposit to offline payer
                 try {
                     Object response = invokeEconomy("depositPlayer", new Class<?>[]{org.bukkit.OfflinePlayer.class, double.class}, payerOffline, amount);
