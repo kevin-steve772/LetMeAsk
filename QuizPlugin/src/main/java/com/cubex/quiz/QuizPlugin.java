@@ -5,6 +5,7 @@ import org.bukkit.OfflinePlayer;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
+import org.bukkit.command.TabCompleter;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -76,7 +77,11 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         getServer().getPluginManager().registerEvents(this, this);
 
         // register command
-        if (getCommand("letmeask") != null) getCommand("letmeask").setExecutor(new QuizCommand());
+        if (getCommand("letmeask") != null) {
+            QuizCommand quizCommand = new QuizCommand();
+            getCommand("letmeask").setExecutor(quizCommand);
+            getCommand("letmeask").setTabCompleter(quizCommand);
+        }
 
         // Start scheduler to post questions periodically (also checks paused state)
         startTask();
@@ -546,7 +551,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     }
 
     // Command handler
-    private class QuizCommand implements CommandExecutor {
+    private class QuizCommand implements CommandExecutor, TabCompleter {
         @Override
         public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
             if (!sender.hasPermission("letmeask.admin")) {
@@ -593,6 +598,25 @@ public class QuizPlugin extends JavaPlugin implements Listener {
                     sender.sendMessage("§c未知子命令: " + sub);
                     return true;
             }
+        }
+
+        @Override
+        public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+            if (!sender.hasPermission("letmeask.admin")) return Collections.emptyList();
+
+            if (args.length == 1) {
+                String prefix = args[0].toLowerCase(Locale.ROOT);
+                return Arrays.asList("start", "stop", "question", "q", "reload", "status").stream()
+                        .filter(subcommand -> subcommand.startsWith(prefix))
+                        .collect(java.util.stream.Collectors.toList());
+            }
+
+            if (args.length == 2 && (args[0].equalsIgnoreCase("question") || args[0].equalsIgnoreCase("q"))) {
+                String prefix = args[1].toLowerCase(Locale.ROOT);
+                return "force".startsWith(prefix) ? Collections.singletonList("force") : Collections.emptyList();
+            }
+
+            return Collections.emptyList();
         }
     }
 
