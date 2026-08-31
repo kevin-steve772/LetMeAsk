@@ -216,7 +216,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         Question q = questions.get(random.nextInt(questions.size()));
         currentQuestion = q;
         currentQuestion.postTime = System.currentTimeMillis();
-        Bukkit.broadcastMessage(messagePrefix() + " §f新题目: §f" + q.question + " §6（在聊天中直接回答抢答）");
+        Bukkit.broadcastMessage(messagePrefix() + " §f新题目: §f" + q.question);
         return true;
     }
 
@@ -261,7 +261,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             double bal = getBalanceOf(payerDisplay);
             if (bal >= rewardAmount) {
                 paused = false;
-                Bukkit.broadcastMessage(messagePrefix() + " §a缴费玩家资金已足额，恢复出题。当前余额: " + bal);
+                Bukkit.broadcastMessage(messagePrefix() + " §a资金已足额，恢复出题。当前余额: " + bal);
             } else {
                 // still paused
                 return;
@@ -276,7 +276,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         currentQuestion = q;
         currentQuestion.postTime = System.currentTimeMillis();
 
-        Bukkit.broadcastMessage(messagePrefix() + " §f新题目: §f" + q.question + " §6（在聊天中直接回答抢答）");
+        Bukkit.broadcastMessage(messagePrefix() + " §f新题目: §f" + q.question + " §6");
     }
 
     @EventHandler
@@ -410,7 +410,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         double payerBal = getBalanceOf(payerDisplay);
         if (payerBal < rewardAmount) {
             paused = true;
-            Bukkit.broadcastMessage(messagePrefix() + " §c出题已暂停：缴费玩家 §f" + payerDisplay + " §c余额不足（需要 " + rewardAmount + "，当前 " + payerBal + "）。");
+            Bukkit.broadcastMessage(messagePrefix() + " §c出题已暂停：资金不足（需要 " + rewardAmount + "，当前 " + payerBal + "）。");
             return;
         }
 
@@ -418,7 +418,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         if (!isEconomyResponseSuccess(w)) {
             paused = true;
             String err = getEconomyResponseError(w);
-            Bukkit.broadcastMessage(messagePrefix() + " §c从缴费玩家扣款失败（错误: " + err + "），出题已暂停。请检查服务器日志。" );
+            Bukkit.broadcastMessage(messagePrefix() + " §c转账失败（错误: " + err + "），出题已暂停。请检查服务器日志。" );
             getLogger().warning("扣款失败: " + err);
             return;
         }
@@ -427,9 +427,9 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         if (!isEconomyResponseSuccess(d)) {
             // refund payer if possible
             String err = getEconomyResponseError(d);
-            getLogger().warning("发放给胜利玩家失败: " + err + "。尝试退款给缴费玩家。");
+            getLogger().warning("发放给胜利玩家失败: " + err + "。尝试退款。");
             depositTo(payerDisplay, rewardAmount);
-            Bukkit.broadcastMessage(messagePrefix() + " §c发放奖励失败，已退款给缴费玩家，请联系管理员。错误: " + err);
+            Bukkit.broadcastMessage(messagePrefix() + " §c发放奖励失败，已退款，请联系管理员。错误: " + err);
             return;
         }
 
