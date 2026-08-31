@@ -4,8 +4,8 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>com.cubex</groupId>
-    <artifactId>QuizPlugin</artifactId>
-    <version>1.0.0</version>
+    <artifactId>LetMeAsk</artifactId>
+    <version>1.1.0</version>
     <packaging>jar</packaging>
 
     <properties>

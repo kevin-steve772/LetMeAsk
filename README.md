@@ -5,10 +5,13 @@
 ## 功能特性
 
 - **定时自动出题**：按照配置间隔自动发布题目
+- **答题超时**：超时无人答对时自动公布答案并出下一题
 - **经济系统集成**：支持 Vault 经济插件，自动扣款/发放奖励
 - **模糊匹配**：答案支持容错匹配（拼写相似度可配置）
 - **人机验证**：答题过快或连续答对过多时触发 HumanVerify 验证
 - **灵活配置**：支持玩家名、UUID、服务器账户、LittleSkin 等支付方式
+
+注意: 人机验证需要依赖[HumanVerify](https://github.com/FZAoao/HumanVerify)插件。如果没有它，人机验证功能将无法使用，但是基本功能不会影响。
 
 ## 环境要求
 
@@ -49,6 +52,9 @@ reward: 50.0
 
 # 自动出题间隔（秒）
 question-interval-seconds: 60
+
+# 答题超时时间（秒），超时后公布答案并出下一题（0=禁用）
+question-timeout-seconds: 30
 
 # 回答速度阈值（秒），过快触发人机验证
 anti-bot-threshold-seconds: 1

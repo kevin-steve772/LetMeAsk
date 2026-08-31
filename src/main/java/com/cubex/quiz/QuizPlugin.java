@@ -44,6 +44,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     private String payerName;
     private double rewardAmount;
     private long questionIntervalSeconds;
+    private long questionTimeoutSeconds;
     private int antiBotThresholdSeconds;
     private int antiBotCorrectAnswerThreshold;
     private double fuzzySimilarityThreshold = 0.75; // default similarity threshold (0-1)
@@ -113,6 +114,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         payerName = baseCfg.getString("payer", "Server");
         rewardAmount = baseCfg.getDouble("reward", 50.0);
         questionIntervalSeconds = baseCfg.getLong("question-interval-seconds", 60L);
+        questionTimeoutSeconds = baseCfg.getLong("question-timeout-seconds", 30L);
         antiBotThresholdSeconds = baseCfg.getInt("anti-bot-threshold-seconds", 1);
         antiBotCorrectAnswerThreshold = baseCfg.getInt("anti-bot-correct-answer-threshold", 3);
         fuzzySimilarityThreshold = baseCfg.getDouble("fuzzy-similarity-threshold", fuzzySimilarityThreshold);
@@ -268,8 +270,20 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             }
         }
 
-        // If a question is active or verifying is in progress, skip
-        if (currentQuestion != null || verifying) return;
+        // If a question is active, check for timeout
+        if (currentQuestion != null) {
+            if (questionTimeoutSeconds > 0 && !verifying) {
+                long elapsed = (System.currentTimeMillis() - currentQuestion.postTime) / 1000L;
+                if (elapsed >= questionTimeoutSeconds) {
+                    Bukkit.broadcastMessage(messagePrefix() + " §c无人答对！答案是: §f" + currentQuestion.answer);
+                    currentQuestion = null;
+                }
+            }
+            return;
+        }
+
+        // If verifying is in progress, skip
+        if (verifying) return;
 
         // Post a new question
         Question q = questions.get(random.nextInt(questions.size()));
