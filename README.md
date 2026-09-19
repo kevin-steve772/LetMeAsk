@@ -24,20 +24,22 @@
 
 ## 安装
 
-1. 下载 `QuizPlugin-1.0.0.jar`
+1. 下载 `LetMeAsk-1.1.0.jar`
 2. 将 JAR 文件放入服务器 `plugins/` 目录
-3. 重启服务器或执行 `/reload`
-4. 编辑 `plugins/QuizPlugin/base.yml` 和 `questions.yml` 进行配置
+3. 重启服务器
+4. 编辑 `plugins/LetMeAsk/base.yml` 和 `questions.yml` 进行配置
 
 ## 命令
 
 | 命令 | 权限 | 说明 |
 |------|------|------|
+| `/letmeask top [数量]` | 全员 | 答题排行榜（默认前 10，最多 20） |
+| `/letmeask stats [玩家名]` | 全员 | 查看答题统计（默认查自己） |
+| `/letmeask status` | 全员 | 查看插件状态 |
 | `/letmeask start` | letmeask.admin | 启动定时出题 |
 | `/letmeask stop` | letmeask.admin | 停止定时出题 |
 | `/letmeask question [force]` | letmeask.admin | 手动发布新题目 |
 | `/letmeask reload` | letmeask.admin | 重载配置文件 |
-| `/letmeask status` | letmeask.admin | 查看插件状态 |
 
 ## 配置
 
@@ -56,13 +58,19 @@ question-interval-seconds: 60
 # 答题超时时间（秒），超时后公布答案并出下一题（0=禁用）
 question-timeout-seconds: 30
 
-# 回答速度阈值（秒），过快触发人机验证
+# 回答用时阈值（秒，支持小数），过快触发人机验证
 anti-bot-threshold-seconds: 1
 
 # 连续答对次数阈值，达到触发人机验证（0=禁用）
 anti-bot-correct-answer-threshold: 3
 
-# 答案模糊匹配阈值（0-1，越高越严格）
+# 连击统计时间窗口（秒），超时未答对则连击清零
+anti-bot-streak-window-seconds: 300
+
+# 人机验证超时（秒），回调长时间未返回时自动解锁并作废本轮
+verify-timeout-seconds: 120
+
+# 答案模糊匹配阈值（0-1，越高越严格；1.0=精确匹配）
 fuzzy-similarity-threshold: 0.75
 
 # 消息前缀
@@ -73,22 +81,26 @@ messages:
 ### questions.yml
 
 ```yaml
-# 格式：题目=答案（每行一条）
+# 纯字符串格式：题目=答案（多答案用 | 分隔，答对任一即可）
+# map 格式：{q, a, weight}，权重越大越容易被抽中（默认 1）
 questions:
   - "中国首都=北京"
   - "2+2=4"
-  - "香蕉是什么颜色=黄色"
+  - "香蕉是什么颜色=黄色|黄"
+  - {q: "太阳系最大的行星是什么", a: "木星|Jupiter", weight: 2}
 ```
+
+统计数据保存在 `plugins/LetMeAsk/stats.yml`（累计出题/答对数、每人答对次数与奖金）。
 
 ## 构建
 
-使用 Maven：
+使用 Maven（推荐）：
 
 ```bash
 mvn clean package
 ```
 
-或使用 Gradle：
+或使用 Gradle（依赖 `libs/` 目录下的本地 jar，可离线构建）：
 
 ```bash
 gradle build
