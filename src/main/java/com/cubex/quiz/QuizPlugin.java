@@ -42,6 +42,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     private volatile boolean verifying = false; // question locked while human verification pending
     private volatile java.util.UUID verifyingPlayer = null;
     private volatile long verifyStartMillis = 0L;
+    private volatile long verifyEpoch = 0L; // 验证轮次：reload/force/超时解锁时自增，旧回调直接丢弃
     private volatile long nextPostAtMillis = 0L; // when the next question may be posted
     private volatile boolean economyAvailable = false;
 
@@ -79,6 +80,8 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     private FileConfiguration statsCfg;
     private final Map<String, Integer> totalCorrect = new HashMap<>();
     private final Map<String, Double> totalEarned = new HashMap<>();
+    private final Set<String> statsDirty = new HashSet<>(); // 自上次落盘后有变更的玩家 key
+    private final Map<String, String> nameCache = new HashMap<>(); // UUID 字符串 -> 最后已知玩家名（top 榜免查）
     private volatile long totalAsked = 0L;
     private volatile long totalAnswered = 0L;
 
@@ -113,13 +116,14 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         startTask();
 
         loadStats();
-        // 统计每 5 分钟落盘一次，避免服崩丢失
+        // 统计落盘：30 秒增量写（只写有变更的玩家），每 10 次做一次全量（约 5 分钟）
         statsSaveTask = new BukkitRunnable() {
+            private int runs = 0;
             @Override
             public void run() {
-                saveStats();
+                saveStats(++runs % 10 != 0);
             }
-        }.runTaskTimerAsynchronously(this, 6000L, 6000L);
+        }.runTaskTimerAsynchronously(this, 600L, 600L);
 
         getLogger().info("QuizPlugin enabled");
     }
@@ -141,32 +145,59 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         statsCfg = YamlConfiguration.loadConfiguration(statsFile);
         totalCorrect.clear();
         totalEarned.clear();
+        nameCache.clear();
         org.bukkit.configuration.ConfigurationSection players = statsCfg.getConfigurationSection("players");
         if (players != null) {
             for (String key : players.getKeys(false)) {
                 totalCorrect.put(key, players.getInt(key + ".correct", 0));
                 totalEarned.put(key, players.getDouble(key + ".earned", 0.0));
+                String n = players.getString(key + ".name");
+                if (n != null && !n.isEmpty()) nameCache.put(key, n);
             }
         }
         totalAsked = statsCfg.getLong("total-asked", 0L);
         totalAnswered = statsCfg.getLong("total-answered", 0L);
     }
 
-    /** 同步写回 stats.yml（调用方注意线程：定时任务走异步，onDisable 走主线程）。 */
-    private synchronized void saveStats() {
+    /**
+     * 写回 stats.yml。incremental=true 时只写 dirty 玩家+累计计数（30s 高频任务用），
+     * false 时全量写回（5 分钟任务与关服时用）。
+     * 调用方注意线程：定时任务走异步，onDisable 走主线程。
+     */
+    private synchronized void saveStats(boolean incremental) {
         if (statsCfg == null || statsFile == null) return;
         try {
             statsCfg.set("total-asked", totalAsked);
             statsCfg.set("total-answered", totalAnswered);
-            for (Map.Entry<String, Integer> e : totalCorrect.entrySet()) {
-                String key = "players." + e.getKey();
-                statsCfg.set(key + ".correct", e.getValue());
-                statsCfg.set(key + ".earned", totalEarned.getOrDefault(e.getKey(), 0.0));
+            if (incremental) {
+                if (statsDirty.isEmpty()) return; // 无变更时连文件都不碰
+                for (String uuid : statsDirty) {
+                    String key = "players." + uuid;
+                    statsCfg.set(key + ".correct", totalCorrect.getOrDefault(uuid, 0));
+                    statsCfg.set(key + ".earned", totalEarned.getOrDefault(uuid, 0.0));
+                    String n = nameCache.get(uuid);
+                    if (n != null) statsCfg.set(key + ".name", n);
+                }
+                statsDirty.clear();
+            } else {
+                for (Map.Entry<String, Integer> e : totalCorrect.entrySet()) {
+                    String key = "players." + e.getKey();
+                    statsCfg.set(key + ".correct", e.getValue());
+                    statsCfg.set(key + ".earned", totalEarned.getOrDefault(e.getKey(), 0.0));
+                    String n = nameCache.get(e.getKey());
+                    if (n != null) statsCfg.set(key + ".name", n);
+                }
+                statsDirty.clear();
             }
             statsCfg.save(statsFile);
         } catch (Exception ex) {
             getLogger().log(Level.WARNING, "保存 stats.yml 失败", ex);
         }
+    }
+
+    /** 全量保存（关服与 5 分钟任务用）。 */
+    private void saveStats() {
+        saveStats(false);
     }
 
     /** 记录一次答对：累计次数与实发金额（0 奖励/自答/无 Vault 时金额为 0 也计数）。 */
@@ -175,7 +206,26 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         totalCorrect.merge(key, 1, Integer::sum);
         if (earned > 0.0) totalEarned.merge(key, earned, Double::sum);
         else totalEarned.putIfAbsent(key, 0.0);
+        if (player.getName() != null) nameCache.put(key, player.getName());
+        statsDirty.add(key);
         totalAnswered++;
+    }
+
+    /**
+     * UUID 反查最后已知玩家名：先读内存缓存，未命中再查 Bukkit（UUID 版走内存映射，不碰磁盘）。
+     * 仍无则回退显示 UUID 前 8 位。
+     */
+    private String displayNameOf(String uuidKey) {
+        String cached = nameCache.get(uuidKey);
+        if (cached != null) return cached;
+        try {
+            org.bukkit.OfflinePlayer off = Bukkit.getOfflinePlayer(java.util.UUID.fromString(uuidKey));
+            if (off.getName() != null) {
+                nameCache.put(uuidKey, off.getName());
+                return off.getName();
+            }
+        } catch (IllegalArgumentException ignored) {}
+        return uuidKey.length() > 8 ? uuidKey.substring(0, 8) : uuidKey;
     }
 
 
@@ -315,6 +365,13 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     private String messagePrefix() {
         String prefix = baseCfg == null ? "&6[教育部]" : baseCfg.getString("messages.prefix", "&6[教育部]");
         return prefix.replace('&', '§');
+    }
+
+    /** 可配置消息：读 messages.<key>，缺失用默认值；支持 & 颜色码与 {arg} 占位。 */
+    private String msg(String key, String def, String arg) {
+        String s = baseCfg == null ? def : baseCfg.getString("messages." + key, def);
+        if (arg != null) s = s.replace("{arg}", arg);
+        return s.replace('&', '§');
     }
 
     private void resolvePayer(String payer) {
@@ -516,12 +573,13 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         }
     }
 
-    /** 清理本轮题目与验证状态（验证通过/失败/超时统一入口）。 */
+    /** 清理本轮题目与验证状态（验证通过/失败/超时统一入口）。epoch 自增使旧回调失效。 */
     private void clearQuestionState() {
         currentQuestion = null;
         verifying = false;
         verifyingPlayer = null;
         verifyStartMillis = 0L;
+        verifyEpoch++;
     }
 
     @EventHandler(ignoreCancelled = true)
@@ -597,6 +655,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
                     if (future instanceof java.util.concurrent.CompletableFuture) {
                         java.util.UUID targetPlayer = p.getUniqueId();
                         java.util.UUID targetQuestion = snapshot.id;
+                        long targetEpoch = verifyEpoch;
                         ((java.util.concurrent.CompletableFuture<?>) future).thenAccept(result -> {
                             try {
                                 // 通过比较枚举名称判断是否为 SUCCESS
@@ -612,7 +671,8 @@ public class QuizPlugin extends JavaPlugin implements Listener {
                                 final boolean passed = ok;
 
                                 Bukkit.getScheduler().runTask(this, () -> {
-                                    // 若已超时兜底/题目轮换，直接丢弃过期回调
+                                    // 若已超时兜底/题目轮换/reload/force，直接丢弃过期回调
+                                    if (targetEpoch != verifyEpoch) return;
                                     if (!verifying || !targetPlayer.equals(verifyingPlayer)) return;
                                     Question cur = currentQuestion;
                                     if (cur == null || cur.id == null || !cur.id.equals(targetQuestion)) return;
@@ -916,20 +976,33 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         @Override
         public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
             if (args.length == 0) {
-                sender.sendMessage("§6LetMeAsk 指令： /letmeask top|stats|status（查询） start|stop|question [force]|reload（管理）");
+                sendHelp(sender);
                 return true;
             }
             String sub = args[0].toLowerCase(Locale.ROOT);
             // 查询类子命令全员可用
             switch (sub) {
+                case "help":
+                case "?":
+                    sendHelp(sender);
+                    return true;
                 case "top":
                     sendTop(sender, args.length > 1 ? args[1] : null);
                     return true;
                 case "stats":
                     sendStats(sender, args.length > 1 ? args[1] : null);
                     return true;
+                case "status":
+                    sendStatus(sender);
+                    return true;
             }
-            // 管理类子命令需要权限
+            boolean adminCmd = sub.equals("start") || sub.equals("stop") || sub.equals("question")
+                    || sub.equals("q") || sub.equals("reload");
+            if (!adminCmd) {
+                sender.sendMessage("§c未知子命令: " + sub);
+                sendHelp(sender);
+                return true;
+            }
             if (!sender.hasPermission("letmeask.admin")) {
                 sender.sendMessage("§c你没有权限执行此命令 (letmeask.admin)");
                 return true;
@@ -957,30 +1030,51 @@ public class QuizPlugin extends JavaPlugin implements Listener {
                 }
                 case "reload": {
                     boolean ok = loadConfigValues();
+                    // 重载时若正在验证：解锁并作废本轮，否则锁会一直占到验证超时
+                    if (verifying) {
+                        if (verifyingPlayer != null) resetStreak(verifyingPlayer);
+                        clearQuestionState();
+                        sender.sendMessage("§e重载时存在未完成的验证，已作废本轮题目");
+                    }
                     // restart scheduler to pick up interval changes
                     startTask();
                     if (ok) sender.sendMessage("§a已重载配置(base.yml 与 questions.yml)");
                     else sender.sendMessage("§e配置已重载，但新题库为空，已保留旧题库继续运行");
                     return true;
                 }
-                case "status": {
-                    sender.sendMessage("§6LetMeAsk 状态:");
-                    sender.sendMessage(" 自动出题: " + (tickerTask != null ? "§a运行中" : "§c已停止"));
-                    sender.sendMessage(" 题库数量: §f" + questions.size());
-                    sender.sendMessage(" 当前题目: " + (currentQuestion != null ? currentQuestion.question : "无"));
-                    sender.sendMessage(" 暂停(余额不足): " + (paused ? "§c是" : "§a否"));
-                    sender.sendMessage(" 人机验证锁定: " + (verifying ? "§c是" : "§a否"));
-                    sender.sendMessage(" 累计出题: §f" + totalAsked + " §7已答对: §f" + totalAnswered);
-                    if (economyAvailable) {
-                        sender.sendMessage(" 支付玩家: §f" + payerDisplay + " §7(余额: " + String.format("%.2f", getBalanceOf(payerDisplay)) + ")");
-                    } else {
-                        sender.sendMessage(" 经济系统: §e未检测到 Vault（纯公告模式，无货币奖励）");
-                    }
-                    return true;
-                }
                 default:
-                    sender.sendMessage("§c未知子命令: " + sub);
                     return true;
+            }
+        }
+
+        private void sendHelp(CommandSender sender) {
+            sender.sendMessage("§6§m----------§r §6LetMeAsk 帮助 §6§m----------");
+            sender.sendMessage("§e/letmeask help §7- 显示此帮助");
+            sender.sendMessage("§e/letmeask top [数量] §7- 答题排行榜（默认 10，最多 20）");
+            sender.sendMessage("§e/letmeask stats [玩家] §7- 查看答题统计（默认自己）");
+            sender.sendMessage("§e/letmeask status §7- 查看插件状态");
+            if (sender.hasPermission("letmeask.admin")) {
+                sender.sendMessage("§6管理命令:");
+                sender.sendMessage("§e/letmeask start §7- 启动定时出题");
+                sender.sendMessage("§e/letmeask stop §7- 停止定时出题");
+                sender.sendMessage("§e/letmeask question [force] §7- 发布新题目（force 强制）");
+                sender.sendMessage("§e/letmeask reload §7- 重载配置");
+            }
+            sender.sendMessage("§6§m--------------------------------");
+        }
+
+        private void sendStatus(CommandSender sender) {
+            sender.sendMessage("§6LetMeAsk 状态:");
+            sender.sendMessage(" 自动出题: " + (tickerTask != null ? "§a运行中" : "§c已停止"));
+            sender.sendMessage(" 题库数量: §f" + questions.size());
+            sender.sendMessage(" 当前题目: " + (currentQuestion != null ? currentQuestion.question : "无"));
+            sender.sendMessage(" 暂停(余额不足): " + (paused ? "§c是" : "§a否"));
+            sender.sendMessage(" 人机验证锁定: " + (verifying ? "§c是" : "§a否"));
+            sender.sendMessage(" 累计出题: §f" + totalAsked + " §7已答对: §f" + totalAnswered);
+            if (economyAvailable) {
+                sender.sendMessage(" 支付玩家: §f" + payerDisplay + " §7(余额: " + String.format("%.2f", getBalanceOf(payerDisplay)) + ")");
+            } else {
+                sender.sendMessage(" 经济系统: §e未检测到 Vault（纯公告模式，无货币奖励）");
             }
         }
 
@@ -989,8 +1083,10 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             if (name == null || name.isEmpty()) {
                 return (sender instanceof Player) ? (Player) sender : null;
             }
-            OfflinePlayer off = Bukkit.getOfflinePlayer(name);
-            // Bukkit#getOfflinePlayer(name) 对从未进服的名字也会返回占位对象，用是否玩过来过滤
+            // 先走缓存（在线/近期离线玩家命中，不碰磁盘）；未命中再走 getOfflinePlayer
+            OfflinePlayer off = Bukkit.getOfflinePlayerIfCached(name);
+            if (off == null) off = Bukkit.getOfflinePlayer(name);
+            // getOfflinePlayer(name) 对从未进服的名字也会返回占位对象，用是否玩过来过滤
             if (!off.hasPlayedBefore() && !off.isOnline()) return null;
             return off;
         }
@@ -998,8 +1094,8 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         private void sendStats(CommandSender sender, String nameArg) {
             OfflinePlayer target = resolveStatsTarget(sender, nameArg);
             if (target == null) {
-                if (nameArg == null) sender.sendMessage("§c控制台请指定玩家名：/letmeask stats <玩家名>");
-                else sender.sendMessage("§c找不到玩家: " + nameArg);
+                if (nameArg == null) sender.sendMessage(msg("console-need-name", "&c控制台请指定玩家名：/letmeask stats <玩家名>", null));
+                else sender.sendMessage(msg("player-not-found", "&c找不到玩家: {arg}", nameArg));
                 return;
             }
             String key = target.getUniqueId().toString();
@@ -1016,25 +1112,20 @@ public class QuizPlugin extends JavaPlugin implements Listener {
                 try {
                     count = Math.min(20, Math.max(1, Integer.parseInt(countArg)));
                 } catch (NumberFormatException ignored) {
-                    sender.sendMessage("§c数量参数无效，使用默认值 10");
+                    sender.sendMessage(msg("invalid-count", "&c数量参数无效，使用默认值 10", null));
                 }
             }
             List<Map.Entry<String, Integer>> sorted = new ArrayList<>(totalCorrect.entrySet());
             sorted.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
             if (sorted.isEmpty()) {
-                sender.sendMessage("§e暂无答题记录");
+                sender.sendMessage(msg("no-records", "&e暂无答题记录", null));
                 return;
             }
             sender.sendMessage("§6答题排行榜 §7(前 " + Math.min(count, sorted.size()) + " 名):");
             int rank = 0;
             for (Map.Entry<String, Integer> e : sorted) {
                 if (++rank > count) break;
-                String name = e.getKey();
-                try {
-                    OfflinePlayer off = Bukkit.getOfflinePlayer(java.util.UUID.fromString(e.getKey()));
-                    if (off.getName() != null) name = off.getName();
-                } catch (IllegalArgumentException ignored) {}
-                sender.sendMessage(" §e" + rank + ". §f" + name + " §7答对 §f" + e.getValue()
+                sender.sendMessage(" §e" + rank + ". §f" + displayNameOf(e.getKey()) + " §7答对 §f" + e.getValue()
                         + " §7奖金 §e" + String.format("%.2f", totalEarned.getOrDefault(e.getKey(), 0.0)));
             }
         }
@@ -1043,7 +1134,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
             if (args.length == 1) {
                 String prefix = args[0].toLowerCase(Locale.ROOT);
-                List<String> subs = new ArrayList<>(Arrays.asList("top", "stats", "status"));
+                List<String> subs = new ArrayList<>(Arrays.asList("help", "top", "stats", "status"));
                 if (sender.hasPermission("letmeask.admin")) {
                     subs.addAll(Arrays.asList("start", "stop", "question", "q", "reload"));
                 }
