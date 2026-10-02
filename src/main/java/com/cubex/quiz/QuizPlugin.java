@@ -20,7 +20,6 @@ import org.bukkit.configuration.file.YamlConfiguration;
 import java.io.File;
 import java.lang.reflect.Method;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
 import java.util.logging.Level;
 
 /**
@@ -33,6 +32,9 @@ import java.util.logging.Level;
 public class QuizPlugin extends JavaPlugin implements Listener {
     // Vault economy provider (kept as Object to avoid compile-time dependency on Vault API)
     private Object econ; // provider instance
+    // 缓存 Vault Economy 的 Class 与 Method：发奖一次最多触发 9 次反射查询，缓存后只剩 invoke
+    private Class<?> economyClass;
+    private final Map<String, Method> economyMethods = new HashMap<>();
 
     private final Random random = new Random();
 
@@ -45,6 +47,8 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     private volatile long verifyEpoch = 0L; // 验证轮次：reload/force/超时解锁时自增，旧回调直接丢弃
     private volatile long nextPostAtMillis = 0L; // when the next question may be posted
     private volatile boolean economyAvailable = false;
+    private String economyProviderName = null;
+    private boolean economyBankSupport = true;
 
     // config values
     private String payerName;
@@ -54,8 +58,16 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     private double antiBotThresholdSeconds;
     private int antiBotCorrectAnswerThreshold;
     private long antiBotStreakWindowSeconds;
+    private int antiBotChatHistoryCount;
+    private double antiBotChatMinIntervalSeconds;
     private long verifyTimeoutSeconds;
     private double fuzzySimilarityThreshold = 0.75; // default similarity threshold (0-1)
+    private boolean celebrateEnabled = true;
+    private String celebrateTitle = "§6§l答对了！";
+    private String celebrateSubtitle = "§e+{reward} 金币";
+    private String celebrateSound = "ENTITY_PLAYER_LEVELUP";
+    private float celebrateVolume = 1.0f;
+    private float celebratePitch = 1.0f;
 
     // resolved payer information (support UUID / OfflinePlayer / Server / LittleSkin via prefix)
     private org.bukkit.OfflinePlayer payerOffline = null;
@@ -71,9 +83,11 @@ public class QuizPlugin extends JavaPlugin implements Listener {
 
     // scheduler handle
     private BukkitTask tickerTask;
+    private BukkitTask leaderboardTask;
     private BukkitTask statsSaveTask;
     private final Map<java.util.UUID, Integer> correctAnswerCounts = new HashMap<>();
     private final Map<java.util.UUID, Long> lastCorrectTimes = new HashMap<>();
+    private final Map<java.util.UUID, ChatHistory> recentChatMessages = new HashMap<>();
 
     // 答题统计（持久化到 stats.yml，key 为玩家 UUID 字符串）
     private File statsFile;
@@ -90,7 +104,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         // Ensure default resource files exist
         saveResource("base.yml", false);
         saveResource("questions.yml", false);
-
+	
         // load configuration files
         if (!loadConfigValues()) {
             getLogger().severe("启动时题库为空，禁用插件。请在 questions.yml 中添加题目后重启。");
@@ -101,11 +115,19 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         economyAvailable = setupEconomy();
         if (!economyAvailable) {
             getLogger().warning("未找到 Vault 经济插件：以“仅公告、无奖励”模式运行，安装 Vault 后请重启或重载插件");
+        } else {
+            getLogger().info("已连接经济后端: " + (economyProviderName != null ? economyProviderName : "未知"));
+            if (payerIsServer && !economyBankSupport) {
+                getLogger().warning("经济后端 " + (economyProviderName != null ? economyProviderName : "未知")
+                        + " 未实现银行账户 API，将按账户名 \"" + payerName + "\" 扣款。"
+                        + "请确保该账户存在且有余额，否则出题会因“资金不足”暂停；"
+                        + "XConomy 可在 config.yml 开启 non-player-account 并给该账户充值。");
+            }
         }
 
         getServer().getPluginManager().registerEvents(this, this);
 
-        // register command
+        // register command（别名 lma 在 plugin.yml 中声明）
         if (getCommand("letmeask") != null) {
             QuizCommand quizCommand = new QuizCommand();
             getCommand("letmeask").setExecutor(quizCommand);
@@ -116,6 +138,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         startTask();
 
         loadStats();
+        startLeaderboardTask();
         // 统计落盘：30 秒增量写（只写有变更的玩家），每 10 次做一次全量（约 5 分钟）
         statsSaveTask = new BukkitRunnable() {
             private int runs = 0;
@@ -131,6 +154,10 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     @Override
     public void onDisable() {
         stopTask();
+        if (leaderboardTask != null && !leaderboardTask.isCancelled()) {
+            leaderboardTask.cancel();
+            leaderboardTask = null;
+        }
         if (statsSaveTask != null && !statsSaveTask.isCancelled()) {
             statsSaveTask.cancel();
             statsSaveTask = null;
@@ -200,8 +227,11 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         saveStats(false);
     }
 
-    /** 记录一次答对：累计次数与实发金额（0 奖励/自答/无 Vault 时金额为 0 也计数）。 */
-    private void recordCorrect(Player player, double earned) {
+    /**
+     * 记录一次答对：累计次数与实发金额（0 奖励/自答/无 Vault 时金额为 0 也计数）。
+     * synchronized：awardWinner 走主线程，saveStats 走异步定时任务，需与保存互斥。
+     */
+    private synchronized void recordCorrect(Player player, double earned) {
         String key = player.getUniqueId().toString();
         totalCorrect.merge(key, 1, Integer::sum);
         if (earned > 0.0) totalEarned.merge(key, earned, Double::sum);
@@ -214,8 +244,9 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     /**
      * UUID 反查最后已知玩家名：先读内存缓存，未命中再查 Bukkit（UUID 版走内存映射，不碰磁盘）。
      * 仍无则回退显示 UUID 前 8 位。
+     * synchronized：top 命令可能与 recordCorrect/saveStats 并发读写 nameCache。
      */
-    private String displayNameOf(String uuidKey) {
+    private synchronized String displayNameOf(String uuidKey) {
         String cached = nameCache.get(uuidKey);
         if (cached != null) return cached;
         try {
@@ -226,6 +257,11 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             }
         } catch (IllegalArgumentException ignored) {}
         return uuidKey.length() > 8 ? uuidKey.substring(0, 8) : uuidKey;
+    }
+
+    /** 线程安全地缓存玩家名（sendStats 走命令线程，直接写 map 会与异步保存竞态）。 */
+    private synchronized void cacheName(String uuidKey, String name) {
+        if (uuidKey != null && name != null) nameCache.put(uuidKey, name);
     }
 
 
@@ -245,6 +281,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
 
         baseCfg = YamlConfiguration.loadConfiguration(baseFile);
         questionsCfg = YamlConfiguration.loadConfiguration(questionsFile);
+        cachedPrefix = null; // base.yml 已重载，前缀缓存失效
 
         payerName = baseCfg.getString("payer", "Server");
         rewardAmount = Math.max(0.0, baseCfg.getDouble("reward", 50.0));
@@ -253,9 +290,17 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         antiBotThresholdSeconds = Math.max(0.0, baseCfg.getDouble("anti-bot-threshold-seconds", 1.0));
         antiBotCorrectAnswerThreshold = Math.max(0, baseCfg.getInt("anti-bot-correct-answer-threshold", 3));
         antiBotStreakWindowSeconds = Math.max(0L, baseCfg.getLong("anti-bot-streak-window-seconds", 300L));
+        antiBotChatHistoryCount = Math.max(2, baseCfg.getInt("anti-bot-chat-history-count", 3));
+        antiBotChatMinIntervalSeconds = Math.max(0.0, baseCfg.getDouble("anti-bot-chat-min-interval-seconds", 0.5));
         verifyTimeoutSeconds = Math.max(10L, baseCfg.getLong("verify-timeout-seconds", 120L));
         fuzzySimilarityThreshold = Math.min(1.0, Math.max(0.0,
                 baseCfg.getDouble("fuzzy-similarity-threshold", fuzzySimilarityThreshold)));
+        celebrateEnabled = baseCfg.getBoolean("celebrate.enabled", true);
+        celebrateTitle = baseCfg.getString("celebrate.title", "§6§l答对了！");
+        celebrateSubtitle = baseCfg.getString("celebrate.subtitle", "§e+{reward} 金币");
+        celebrateSound = baseCfg.getString("celebrate.sound", "ENTITY_PLAYER_LEVELUP");
+        celebrateVolume = (float) Math.max(0.0, baseCfg.getDouble("celebrate.volume", 1.0));
+        celebratePitch = (float) Math.max(0.0, baseCfg.getDouble("celebrate.pitch", 1.0));
 
         // resolve payer to a stable identifier (UUID/name/Server/LittleSkin)
         resolvePayer(payerName);
@@ -362,9 +407,71 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         }.runTaskTimer(this, 20L, 20L); // 1s 粒度，保证超时与验证兜底准时
     }
 
+    private void startLeaderboardTask() {
+        if (leaderboardTask != null && !leaderboardTask.isCancelled()) {
+            leaderboardTask.cancel();
+        }
+        long oneHourTicks = 60L * 60L * 20L;
+        leaderboardTask = new BukkitRunnable() {
+            @Override
+            public void run() {
+                broadcastTop(10);
+            }
+        }.runTaskTimer(this, oneHourTicks, oneHourTicks);
+    }
+
+    private void broadcastTop(int count) {
+        List<String> messages = topMessages(count);
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            for (String message : messages) {
+                player.sendMessage(message);
+            }
+        }
+    }
+
+    private List<String> topMessages(int count) {
+        List<Map.Entry<String, Integer>> sorted = new ArrayList<>(totalCorrect.entrySet());
+        sorted.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
+        if (sorted.isEmpty()) {
+            return Collections.singletonList(msg("no-records", "&e暂无答题记录", null));
+        }
+
+        List<String> messages = new ArrayList<>();
+        messages.add("§6答题排行榜 §7(前 " + Math.min(count, sorted.size()) + " 名):");
+        int rank = 0;
+        for (Map.Entry<String, Integer> entry : sorted) {
+            if (++rank > count) break;
+            messages.add(" §e" + rank + ". §f" + displayNameOf(entry.getKey()) + " §7答对 §f" + entry.getValue()
+                    + " §7奖金 §e" + String.format("%.2f", totalEarned.getOrDefault(entry.getKey(), 0.0)));
+        }
+        return messages;
+    }
+
+    private volatile String cachedPrefix = null; // prefix 缓存：reload 时失效
+
     private String messagePrefix() {
+        String hit = cachedPrefix;
+        if (hit != null) return hit;
         String prefix = baseCfg == null ? "&6[教育部]" : baseCfg.getString("messages.prefix", "&6[教育部]");
-        return prefix.replace('&', '§');
+        hit = prefix.replace('&', '§');
+        cachedPrefix = hit;
+        return hit;
+    }
+
+    // Keep Bukkit's legacy text APIs for compatibility with both Paper and Spigot.
+    @SuppressWarnings("deprecation")
+    private void broadcastLegacy(String message) {
+        Bukkit.broadcastMessage(message);
+    }
+
+    @SuppressWarnings("deprecation")
+    private void kickLegacy(Player player, String reason) {
+        player.kickPlayer(reason);
+    }
+
+    @SuppressWarnings("deprecation")
+    private void showLegacyTitle(Player player, String title, String subtitle) {
+        player.sendTitle(title, subtitle);
     }
 
     /** 可配置消息：读 messages.<key>，缺失用默认值；支持 & 颜色码与 {arg} 占位。 */
@@ -448,8 +555,11 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         q.postTime = System.currentTimeMillis();
         q.id = java.util.UUID.randomUUID();
         currentQuestion = q;
+        synchronized (recentChatMessages) {
+            recentChatMessages.clear();
+        }
         totalAsked++;
-        Bukkit.broadcastMessage(messagePrefix() + " §f新题目: §f" + q.question);
+        broadcastLegacy(messagePrefix() + " §f新题目: §f" + q.question);
     }
 
     /**
@@ -481,46 +591,58 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         return questions.get(questions.size() - 1);
     }
 
-    /** 任一候选答案匹配即算答对。 */
-    private boolean matchesAny(String provided, List<String> answers) {
-        if (answers == null) return false;
-        for (String answer : answers) {
-            if (matches(provided, answer)) return true;
+    /**
+     * 任一候选答案匹配即算答对。normalizedAnswers 为出题时预归一化的答案，
+     * 聊天消息只归一化一次，避免每条消息重复归一化题库答案。
+     */
+    private boolean matchesAny(String providedNormalized, List<String> normalizedAnswers) {
+        if (providedNormalized == null || providedNormalized.isEmpty() || normalizedAnswers == null) return false;
+        for (String b : normalizedAnswers) {
+            if (b.isEmpty()) continue;
+            if (providedNormalized.equals(b)) return true;
+            if (fuzzySimilarityThreshold >= 1.0) continue; // 1.0 = 严格精确匹配
+            int max = Math.max(providedNormalized.length(), b.length());
+            // sim >= threshold  <=>  dist <= max * (1 - threshold)，上界早退
+            int maxDist = (int) Math.floor(max * (1.0 - fuzzySimilarityThreshold));
+            int dist = levenshtein(providedNormalized, b, maxDist);
+            if (dist <= maxDist) return true;
         }
         return false;
     }
 
-    private boolean matches(String provided, String answer) {
-        if (provided == null || answer == null) return false;
-        String a = normalize(provided);
-        String b = normalize(answer);
-        if (a.isEmpty() || b.isEmpty()) return false;
-        if (a.equals(b)) return true;
-        if (fuzzySimilarityThreshold >= 1.0) return false; // 1.0 = 严格精确匹配
-        int dist = levenshtein(a, b);
-        int max = Math.max(a.length(), b.length());
-        double sim = 1.0 - (double) dist / (double) max;
-        return sim >= fuzzySimilarityThreshold;
-    }
+    /** 预编译：String.replaceAll 每次都编译 Pattern，高频聊天路径下不可接受。 */
+    private static final java.util.regex.Pattern NON_ALNUM = java.util.regex.Pattern.compile("[^\\p{L}\\p{N}]+");
 
-    private String normalize(String s) {
+    private static String normalize(String s) {
         // Locale.ROOT：避免土耳其语等 locale 下 I/i 大小写转换异常
-        return s == null ? "" : s.replaceAll("[^\\p{L}\\p{N}]+", "").toLowerCase(Locale.ROOT);
+        return s == null ? "" : NON_ALNUM.matcher(s).replaceAll("").toLowerCase(Locale.ROOT);
     }
 
-    private int levenshtein(String s1, String s2) {
-        int[] prev = new int[s2.length() + 1];
-        int[] curr = new int[s2.length() + 1];
-        for (int j = 0; j <= s2.length(); j++) prev[j] = j;
-        for (int i = 1; i <= s1.length(); i++) {
+    /**
+     * 带上界的编辑距离：若中途已能确定距离超过 maxDist，直接返回 maxDist+1。
+     * 调用方只关心“是否达标”，超标的精确值无意义，早退省掉剩余 DP 计算。
+     */
+    private int levenshtein(String s1, String s2, int maxDist) {
+        int n = s1.length();
+        int m = s2.length();
+        if (Math.abs(n - m) > maxDist) return maxDist + 1; // 长度差本身就是下界
+        int[] prev = new int[m + 1];
+        int[] curr = new int[m + 1];
+        for (int j = 0; j <= m; j++) prev[j] = j;
+        for (int i = 1; i <= n; i++) {
             curr[0] = i;
-            for (int j = 1; j <= s2.length(); j++) {
+            int rowMin = curr[0];
+            for (int j = 1; j <= m; j++) {
                 int cost = s1.charAt(i - 1) == s2.charAt(j - 1) ? 0 : 1;
                 curr[j] = Math.min(Math.min(curr[j - 1] + 1, prev[j] + 1), prev[j - 1] + cost);
+                if (curr[j] < rowMin) rowMin = curr[j];
             }
-            System.arraycopy(curr, 0, prev, 0, prev.length);
+            if (rowMin > maxDist) return maxDist + 1; // 整行都超标，后续只会更大
+            int[] tmp = prev;
+            prev = curr;
+            curr = tmp;
         }
-        return prev[s2.length()];
+        return prev[m];
     }
 
     private final List<Question> questions = new ArrayList<>();
@@ -534,7 +656,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             double bal = getBalanceOf(payerDisplay);
             if (bal >= rewardAmount) {
                 paused = false;
-                Bukkit.broadcastMessage(messagePrefix() + " §a资金已足额，恢复出题。当前余额: " + bal);
+                broadcastLegacy(messagePrefix() + " §a资金已足额，恢复出题。当前余额: " + bal + "，预计还可以奖励" + (bal / rewardAmount) + "次。");
             } else {
                 return;
             }
@@ -542,10 +664,17 @@ public class QuizPlugin extends JavaPlugin implements Listener {
 
         // 验证超时兜底：回调永不返回时解锁，避免永久锁死
         if (verifying) {
+            Player p = verifyingPlayer == null ? null : Bukkit.getPlayer(verifyingPlayer);
             long elapsedMillis = System.currentTimeMillis() - verifyStartMillis;
             if (elapsedMillis >= verifyTimeoutSeconds * 1000L) {
-                getLogger().warning("人机验证超时（" + verifyTimeoutSeconds + "s），自动解锁并作废本轮题目");
-                Bukkit.broadcastMessage(messagePrefix() + " §c人机验证超时，本轮题目作废。");
+                if (p != null) {
+                    getLogger().warning(p.getName() + "人机验证超时（" + verifyTimeoutSeconds + "s），自动解锁作废本轮题目，并踢出玩家");
+                    broadcastLegacy(messagePrefix() + " §c玩家 " + p.getName() + " 因人机验证超时被踢出服务器，本轮题目作废。");
+                    kickLegacy(p, "人机验证超时");
+                } else {
+                    getLogger().warning("人机验证超时（" + verifyTimeoutSeconds + "s），玩家已离线，自动解锁并作废本轮题目");
+                    broadcastLegacy(messagePrefix() + " §c人机验证超时，本轮题目作废。");
+                }
                 clearQuestionState();
             }
             return;
@@ -556,10 +685,10 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             if (questionTimeoutSeconds > 0) {
                 long elapsedMillis = System.currentTimeMillis() - currentQuestion.postTime;
                 if (elapsedMillis >= questionTimeoutSeconds * 1000L) {
-                    Bukkit.broadcastMessage(messagePrefix() + " §c无人答对！答案是: §f" + currentQuestion.displayAnswer());
+                    broadcastLegacy(messagePrefix() + " §c无人答对！答案是: §f" + currentQuestion.displayAnswer());
                     correctAnswerCounts.clear();
                     lastCorrectTimes.clear();
-                    currentQuestion = null;
+                    clearQuestionState();
                     nextPostAtMillis = System.currentTimeMillis() + questionIntervalSeconds * 1000L;
                 }
             }
@@ -580,22 +709,30 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         verifyingPlayer = null;
         verifyStartMillis = 0L;
         verifyEpoch++;
+        synchronized (recentChatMessages) {
+            recentChatMessages.clear();
+        }
     }
 
     @EventHandler(ignoreCancelled = true)
+    @SuppressWarnings("deprecation")
     public void onPlayerChat(AsyncPlayerChatEvent event) {
         Question snapshot = currentQuestion;
         if (snapshot == null || verifying) return;
 
         String msg = event.getMessage().trim();
+        String normalizedMsg = normalize(msg);
         Player player = event.getPlayer();
+        long messageTime = System.currentTimeMillis();
+        boolean correctAnswer = msg.length() <= 100 && matchesAny(normalizedMsg, snapshot.normalizedAnswers);
+        boolean chatTooFast = recordChatMessage(player.getUniqueId(), snapshot.id, messageTime, correctAnswer);
 
         // 超长刷屏消息直接拒绝，避免无意义的模糊匹配计算
         if (msg.length() > 100) return;
 
-        if (matchesAny(msg, snapshot.answers)) {
+        if (correctAnswer) {
             // 切主线程发奖，携带题目 id：若题目已轮换/作废则拒绝，防止旧题答案领走新题奖励
-            Bukkit.getScheduler().runTask(this, () -> handleCorrectAnswer(player, snapshot.id));
+            Bukkit.getScheduler().runTask(this, () -> handleCorrectAnswer(player, snapshot.id, chatTooFast));
         }
     }
 
@@ -605,10 +742,43 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         resetStreak(event.getPlayer().getUniqueId());
     }
 
-    private synchronized void handleCorrectAnswer(Player player, java.util.UUID questionId) {
+    private boolean recordChatMessage(java.util.UUID playerId, java.util.UUID questionId, long messageTime,
+                                      boolean correctAnswer) {
+        synchronized (recentChatMessages) {
+            ChatHistory history = recentChatMessages.get(playerId);
+            if (history == null || !history.questionId.equals(questionId)) {
+                history = new ChatHistory(questionId);
+                recentChatMessages.put(playerId, history);
+            }
+            history.timestamps.addLast(messageTime);
+            while (history.timestamps.size() > antiBotChatHistoryCount) {
+                history.timestamps.removeFirst();
+            }
+            if (!correctAnswer || antiBotChatMinIntervalSeconds <= 0.0 || history.timestamps.size() < 2) {
+                return false;
+            }
+            long minimumIntervalMillis = (long) (antiBotChatMinIntervalSeconds * 1000.0);
+            Long previous = null;
+            for (Long timestamp : history.timestamps) {
+                if (previous != null && timestamp - previous < minimumIntervalMillis) return true;
+                previous = timestamp;
+            }
+            return false;
+        }
+    }
+
+    private synchronized void handleCorrectAnswer(Player player, java.util.UUID questionId, boolean chatTooFast) {
         Question snapshot = currentQuestion;
         if (snapshot == null || verifying) return; // double-check
         if (snapshot.id == null || !snapshot.id.equals(questionId)) return; // 题目已轮换或作废
+
+        if (chatTooFast) {
+            resetStreak(player.getUniqueId());
+            clearQuestionState();
+            broadcastLegacy(messagePrefix() + " §c玩家 §f" + player.getName() + " §c因聊天消息间隔过短被踢出服务器。");
+            kickLegacy(player, "聊天消息间隔过短");
+            return;
+        }
 
         long now = System.currentTimeMillis();
         double deltaSecs = (now - snapshot.postTime) / 1000.0; // 浮点精度，避免 1.9s 被截断成 1s
@@ -634,7 +804,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             verifyStartMillis = System.currentTimeMillis();
             Player p = player;
             String reason = answeredTooFast ? "答题速度过快" : "连续答对次数过多";
-            Bukkit.broadcastMessage(messagePrefix() + " §c玩家 §f" + p.getName() + " §c"
+            broadcastLegacy(messagePrefix() + " §c玩家 §f" + p.getName() + " §c"
                     + reason + "，需要进行人机验证...");
 
             // Try to call HumanVerifyApi as in provided snippet. This requires that the HumanVerify API
@@ -642,7 +812,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             try {
                 // 使用反射调用 HumanVerifyApi，避免将第三方实现打进本插件。
                 Class<?> apiClass = Class.forName("org.cubexmc.humanverify.api.HumanVerifyApi");
-                Object api = Bukkit.getServicesManager().load((Class) apiClass);
+                Object api = Bukkit.getServicesManager().load(apiClass);
                 if (api != null) {
                     Object future = null;
                     try {
@@ -689,8 +859,8 @@ public class QuizPlugin extends JavaPlugin implements Listener {
                                     } else {
                                         resetStreak(targetPlayer);
                                         clearQuestionState();
-                                        Bukkit.broadcastMessage(messagePrefix() + " §c玩家 §f" + p.getName() + " §c未通过人机验证，已被踢出服务器。");
-                                        p.kickPlayer("未通过人机验证");
+                                        broadcastLegacy(messagePrefix() + " §c玩家 §f" + p.getName() + " §c未通过人机验证，已被踢出服务器。");
+                                        kickLegacy(p, "未通过人机验证");
                                     }
                                 });
                             } catch (Throwable t) {
@@ -734,32 +904,65 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     private void resetStreak(java.util.UUID uuid) {
         correctAnswerCounts.remove(uuid);
         lastCorrectTimes.remove(uuid);
+        synchronized (recentChatMessages) {
+            recentChatMessages.remove(uuid);
+        }
+    }
+
+    /**
+     * 答对庆祝：只给答对者发 Title（全服广播太扰民），音效全服可听。
+     * earned <= 0 时副标题不显示金额。
+     */
+    private void celebrate(Player winner, double earned) {
+        if (!celebrateEnabled) return;
+        try {
+            String sub = celebrateSubtitle.replace("{reward}", String.format("%.0f", earned));
+            if (earned <= 0.0) sub = "";
+            showLegacyTitle(winner, celebrateTitle.replace('&', '§'), sub.replace('&', '§'));
+        } catch (Throwable t) {
+            getLogger().fine("发送 Title 失败: " + t.getMessage());
+        }
+        if (celebrateSound == null || celebrateSound.isEmpty() || "none".equalsIgnoreCase(celebrateSound)) return;
+        try {
+            org.bukkit.Sound sound = org.bukkit.Sound.valueOf(celebrateSound.toUpperCase(Locale.ROOT));
+            for (Player p : Bukkit.getOnlinePlayers()) {
+                try {
+                    p.playSound(p.getLocation(), sound, celebrateVolume, celebratePitch);
+                } catch (Throwable ignored) {}
+            }
+        } catch (IllegalArgumentException e) {
+            getLogger().warning("celebrate.sound 配置无效: " + celebrateSound + "，已跳过音效");
+            celebrateSound = "none"; // 避免每题刷一次告警
+        }
     }
 
     private void awardWinner(Player winner) {
         // 无 Vault 时降级为纯公告模式，不暂停出题
         if (!economyAvailable) {
             recordCorrect(winner, 0.0);
-            Bukkit.broadcastMessage(messagePrefix() + " §a玩家 §f" + winner.getName() + " §a答对了问题！§7（未安装 Vault，本轮无货币奖励）");
+            broadcastLegacy(messagePrefix() + " §a玩家 §f" + winner.getName() + " §a答对了问题！§7（未安装 Vault，本轮无货币奖励）");
+            celebrate(winner, 0.0);
             return;
         }
         // 奖励为 0：跳过全部转账调用，直接公告
         if (rewardAmount <= 0.0) {
             recordCorrect(winner, 0.0);
-            Bukkit.broadcastMessage(messagePrefix() + " §a玩家 §f" + winner.getName() + " §a答对了问题！");
+            broadcastLegacy(messagePrefix() + " §a玩家 §f" + winner.getName() + " §a答对了问题！");
+            celebrate(winner, 0.0);
             return;
         }
         // 答对者就是出资人：左手倒右手，跳过转账
         if (isPayer(winner)) {
             recordCorrect(winner, 0.0);
-            Bukkit.broadcastMessage(messagePrefix() + " §a玩家 §f" + winner.getName() + " §a答对了问题！§7（出资人自答，无需转账）");
+            broadcastLegacy(messagePrefix() + " §a玩家 §f" + winner.getName() + " §a答对了问题！§7（出资人自答，无需转账）");
+            celebrate(winner, 0.0);
             return;
         }
         // Check payer balance
         double payerBal = getBalanceOf(payerDisplay);
         if (payerBal < rewardAmount) {
             paused = true;
-            Bukkit.broadcastMessage(messagePrefix() + " §c出题已暂停：资金不足（需要 " + rewardAmount + "，当前 " + payerBal + "）。");
+            broadcastLegacy(messagePrefix() + " §c出题已暂停：资金不足（需要 " + rewardAmount + "，当前 " + payerBal + "）。");
             return;
         }
 
@@ -767,7 +970,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         if (!isEconomyResponseSuccess(w)) {
             paused = true;
             String err = getEconomyResponseError(w);
-            Bukkit.broadcastMessage(messagePrefix() + " §c转账失败（错误: " + err + "），出题已暂停。请检查服务器日志。" );
+            broadcastLegacy(messagePrefix() + " §c转账失败（错误: " + err + "），出题已暂停。请检查服务器日志。" );
             getLogger().warning("扣款失败: " + err);
             return;
         }
@@ -778,25 +981,31 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             String err = getEconomyResponseError(d);
             getLogger().warning("发放给胜利玩家失败: " + err + "。尝试退款。");
             depositTo(payerDisplay, rewardAmount);
-            Bukkit.broadcastMessage(messagePrefix() + " §c发放奖励失败，已退款，请联系管理员。错误: " + err);
+            broadcastLegacy(messagePrefix() + " §c发放奖励失败，已退款，请联系管理员。错误: " + err);
             return;
         }
 
         recordCorrect(winner, rewardAmount);
-        Bukkit.broadcastMessage(messagePrefix() + " §a玩家 §f" + winner.getName() + " §a答对了问题，获得 §e" + rewardAmount + " §a货币！");
+        broadcastLegacy(messagePrefix() + " §a玩家 §f" + winner.getName() + " §a答对了问题，获得 §e" + rewardAmount + " §a货币！");
+        celebrate(winner, rewardAmount);
     }
 
     private boolean setupEconomy() {
         try {
             Class<?> econClass = Class.forName("net.milkbowl.vault.economy.Economy");
             // get registration via ServicesManager.getRegistration(Class)
-            Object rsp = getServer().getServicesManager().getRegistration((Class) econClass);
+            Object rsp = getServer().getServicesManager().getRegistration(econClass);
             if (rsp == null) return false;
             // RegisteredServiceProvider has method getProvider()
             Method getProvider = rsp.getClass().getMethod("getProvider");
             Object provider = getProvider.invoke(rsp);
             this.econ = provider;
-            return this.econ != null;
+            if (this.econ == null) return false;
+            this.economyClass = econClass;
+            this.economyMethods.clear();
+            this.economyProviderName = readEconomyName();
+            this.economyBankSupport = readEconomyBankSupport();
+            return true;
         } catch (ClassNotFoundException cnf) {
             getLogger().warning("Vault API 不在类路径中，无法加载 Economy 接口");
             return false;
@@ -806,10 +1015,29 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         }
     }
 
+    private String readEconomyName() {
+        try {
+            Object r = invokeEconomy("getName", new Class<?>[0]);
+            if (r instanceof String) {
+                String s = ((String) r).trim();
+                if (!s.isEmpty()) return s;
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private boolean readEconomyBankSupport() {
+        try {
+            Object r = invokeEconomy("hasBankSupport", new Class<?>[0]);
+            if (r instanceof Boolean) return (Boolean) r;
+        } catch (Throwable ignored) {}
+        return true;
+    }
+
     // Reflection helpers for interacting with economy provider without compile-time Vault dependency
     private double getBalanceOf(String who) {
         if (econ == null) return 0.0;
-            if (payerIsServer) {
+        if (payerIsServer && economyBankSupport) {
             Double balance = extractBalance(invokeEconomy("bankBalance", new Class<?>[]{String.class}, who));
             if (balance != null) return balance;
         }
@@ -836,7 +1064,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
 
     private Object withdrawFrom(String who, double amount) {
         if (econ == null) return null;
-        if (payerIsServer) {
+        if (payerIsServer && economyBankSupport) {
             Object response = invokeEconomy("bankWithdraw", new Class<?>[]{String.class, double.class}, who, amount);
             if (response != null) return response;
         }
@@ -875,7 +1103,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     private Object depositTo(String who, double amount) {
         if (econ == null) return null;
         try {
-            if (payerIsServer && who.equals(payerDisplay)) {
+            if (payerIsServer && economyBankSupport && who.equals(payerDisplay)) {
                 Object bankResponse = invokeEconomy("bankDeposit", new Class<?>[]{String.class, double.class}, who, amount);
                 if (bankResponse != null) return bankResponse;
             }
@@ -897,11 +1125,20 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     }
 
     private Object invokeEconomy(String methodName, Class<?>[] parameterTypes, Object... arguments) {
+        if (econ == null || economyClass == null) return null;
         try {
-            Class<?> economyInterface = Class.forName("net.milkbowl.vault.economy.Economy");
-            return economyInterface.getMethod(methodName, parameterTypes).invoke(econ, arguments);
-        } catch (NoSuchMethodException ignored) {
-            return null;
+            String cacheKey = methodName + Arrays.toString(parameterTypes);
+            Method m = economyMethods.get(cacheKey);
+            if (m == null && !economyMethods.containsKey(cacheKey)) {
+                try {
+                    m = economyClass.getMethod(methodName, parameterTypes);
+                } catch (NoSuchMethodException ignored) {
+                    m = null;
+                }
+                economyMethods.put(cacheKey, m); // null 也缓存：缺失的方法下次直接返回
+            }
+            if (m == null) return null;
+            return m.invoke(econ, arguments);
         } catch (Throwable t) {
             getLogger().log(Level.WARNING, "调用经济方法 " + methodName + " 时出错", t);
             return null;
@@ -1042,9 +1279,8 @@ public class QuizPlugin extends JavaPlugin implements Listener {
                     else sender.sendMessage("§e配置已重载，但新题库为空，已保留旧题库继续运行");
                     return true;
                 }
-                default:
-                    return true;
             }
+            return true; // unreachable：adminCmd 已前置过滤，但保留以满足编译
         }
 
         private void sendHelp(CommandSender sender) {
@@ -1073,6 +1309,8 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             sender.sendMessage(" 累计出题: §f" + totalAsked + " §7已答对: §f" + totalAnswered);
             if (economyAvailable) {
                 sender.sendMessage(" 支付玩家: §f" + payerDisplay + " §7(余额: " + String.format("%.2f", getBalanceOf(payerDisplay)) + ")");
+                sender.sendMessage(" 经济后端: §f" + (economyProviderName != null ? economyProviderName : "未知")
+                        + (payerIsServer && !economyBankSupport ? " §7(无银行账户，按账户名扣款)" : ""));
             } else {
                 sender.sendMessage(" 经济系统: §e未检测到 Vault（纯公告模式，无货币奖励）");
             }
@@ -1099,7 +1337,8 @@ public class QuizPlugin extends JavaPlugin implements Listener {
                 return;
             }
             String key = target.getUniqueId().toString();
-            String display = target.getName() != null ? target.getName() : key;
+            cacheName(key, target.getName()); // 顺手更新缓存（加锁，与异步保存互斥）
+            String display = displayNameOf(key);
             int correct = totalCorrect.getOrDefault(key, 0);
             double earned = totalEarned.getOrDefault(key, 0.0);
             sender.sendMessage("§6玩家 §f" + display + " §6的答题统计:");
@@ -1115,19 +1354,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
                     sender.sendMessage(msg("invalid-count", "&c数量参数无效，使用默认值 10", null));
                 }
             }
-            List<Map.Entry<String, Integer>> sorted = new ArrayList<>(totalCorrect.entrySet());
-            sorted.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
-            if (sorted.isEmpty()) {
-                sender.sendMessage(msg("no-records", "&e暂无答题记录", null));
-                return;
-            }
-            sender.sendMessage("§6答题排行榜 §7(前 " + Math.min(count, sorted.size()) + " 名):");
-            int rank = 0;
-            for (Map.Entry<String, Integer> e : sorted) {
-                if (++rank > count) break;
-                sender.sendMessage(" §e" + rank + ". §f" + displayNameOf(e.getKey()) + " §7答对 §f" + e.getValue()
-                        + " §7奖金 §e" + String.format("%.2f", totalEarned.getOrDefault(e.getKey(), 0.0)));
-            }
+            topMessages(count).forEach(sender::sendMessage);
         }
 
         @Override
@@ -1155,7 +1382,8 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     // Simple question holder (supports multiple accepted answers + weight)
     private static class Question {
         final String question;
-        final List<String> answers; // 任一匹配即算答对
+        final List<String> answers; // 任一匹配即算答对（原始文本，用于公布答案）
+        final List<String> normalizedAnswers; // 预归一化答案，判定用，避免每条聊天重复归一化
         final int weight; // 出题权重（>=1），越大越容易被抽中
         volatile long postTime;
         volatile java.util.UUID id;
@@ -1167,12 +1395,24 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         Question(String q, List<String> as, int w) {
             this.question = q;
             this.answers = Collections.unmodifiableList(new ArrayList<>(as));
+            List<String> norm = new ArrayList<>(as.size());
+            for (String a : as) norm.add(normalize(a));
+            this.normalizedAnswers = Collections.unmodifiableList(norm);
             this.weight = Math.max(1, w);
         }
 
         /** 公布答案时展示的首选答案。 */
         String displayAnswer() {
             return answers.isEmpty() ? "" : answers.get(0);
+        }
+    }
+
+    private static class ChatHistory {
+        final java.util.UUID questionId;
+        final Deque<Long> timestamps = new ArrayDeque<>();
+
+        ChatHistory(java.util.UUID questionId) {
+            this.questionId = questionId;
         }
     }
 }

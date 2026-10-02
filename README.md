@@ -9,6 +9,7 @@
 - **经济系统集成**：支持 Vault 经济插件，自动扣款/发放奖励
 - **模糊匹配**：答案支持容错匹配（拼写相似度可配置）
 - **人机验证**：答题过快或连续答对过多时触发 HumanVerify 验证
+- **答对特效**：答对者收到 Title 标题，全服播放升级音效（均可在 `celebrate` 下配置开关）
 - **灵活配置**：支持玩家名、UUID、服务器账户、LittleSkin 等支付方式
 
 注意: 人机验证需要依赖[HumanVerify](https://github.com/FZAoao/HumanVerify)插件。如果没有它，人机验证功能将无法使用，但是基本功能不会影响。
@@ -33,7 +34,7 @@
 
 | 命令 | 权限 | 说明 |
 |------|------|------|
-| `/letmeask` 或 `/letmeask help` | 全员 | 帮助菜单（管理员额外显示管理命令） |
+| `/letmeask` 或 `/letmeask help`（简写 `/lma`） | 全员 | 帮助菜单（管理员额外显示管理命令） |
 | `/letmeask top [数量]` | 全员 | 答题排行榜（默认前 10，最多 20） |
 | `/letmeask stats [玩家名]` | 全员 | 查看答题统计（默认查自己） |
 | `/letmeask status` | 全员 | 查看插件状态 |
@@ -41,6 +42,9 @@
 | `/letmeask stop` | letmeask.admin | 停止定时出题 |
 | `/letmeask question [force]` | letmeask.admin | 手动发布新题目 |
 | `/letmeask reload` | letmeask.admin | 重载配置文件 |
+
+所有子命令均支持简写 `/lma`（如 `/lma top`、`/lma stats`）。
+排行榜也会每小时在游戏内全局广播一次。
 
 ## 配置
 
@@ -74,6 +78,15 @@ verify-timeout-seconds: 120
 # 答案模糊匹配阈值（0-1，越高越严格；1.0=精确匹配）
 fuzzy-similarity-threshold: 0.75
 
+# 答对庆祝：Title 只发给答对者，音效全服可听（sound=none 关闭音效）
+celebrate:
+  enabled: true
+  title: "&6&l答对了！"
+  subtitle: "&e+{reward} 金币"
+  sound: ENTITY_PLAYER_LEVELUP
+  volume: 1.0
+  pitch: 1.0
+
 # 消息前缀
 messages:
   prefix: "&6[教育部]"
@@ -106,6 +119,16 @@ mvn clean package
 ```bash
 gradle build
 ```
+
+### 版本管理
+
+版本号唯一来源是 `pom.xml` 的 `<revision>`，`plugin.yml` 与产物 jar 名构建时自动跟随，**发版只改这一处**：
+
+```bash
+mvn clean package -Drevision=1.2.0
+```
+
+CI 每次构建会自动追加 commit 短哈希（如 `1.1.0-a1b2c3d`），`latest` release 永远是最新构建。
 
 ## 许可证
 
