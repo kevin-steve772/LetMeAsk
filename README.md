@@ -1,6 +1,6 @@
 # LetMeAsk
 
-一个 Minecraft 服务器抢答活动插件，定时在聊天栏出题，玩家抢答可获得金币奖励。
+一个 Minecraft 服务器抢答活动插件，定时在聊天栏、动作栏或标题出题，玩家抢答可获得金币奖励。
 
 ## 功能特性
 
@@ -9,10 +9,14 @@
 - **经济系统集成**：支持 Vault 经济插件，自动扣款/发放奖励
 - **模糊匹配**：答案支持容错匹配（拼写相似度可配置）
 - **人机验证**：答题过快或连续答对过多时触发 HumanVerify 验证
+- **防脚本枚举**：本轮题目期间聊天刷屏过快直接踢出（`anti-bot-chat-*` 配置）
 - **答对特效**：答对者收到 Title 标题，全服播放升级音效（均可在 `celebrate` 下配置开关）
+- **物品奖励**：与金币叠加发放，支持自定义名/lore/附魔，可随机其一，背包满掉地上（`items` 配置）
+- **多语言**：`language: zh/en` 一键切换，英文段缺键自动回退中文
+- **匿名统计**：通过 bStats 收集匿名使用数据（类已 relocate 进插件自身包；插件 id 未注册前不上报，全局可在 `plugins/bStats/config.json` 关闭）
 - **灵活配置**：支持玩家名、UUID、服务器账户、LittleSkin 等支付方式
 
-注意: 人机验证需要依赖[HumanVerify](https://github.com/FZAoao/HumanVerify)插件。如果没有它，人机验证功能将无法使用，但是基本功能不会影响。
+注意: 人机验证需要依赖[HumanVerify](https://github.com/FZAoao/HumanVerify)插件。如果没有它，触发验证时默认 **拒绝发奖并作废本轮**（`anti-bot-verify-unavailable: deny`）——这是防止脚本绕过验证刷奖励的安全默认。确实需要旧版“直接发奖”行为时，把该项改成 `award`。
 
 ## 环境要求
 
@@ -25,8 +29,8 @@
 
 ## 安装
 
-1. 下载 `LetMeAsk-1.1.0.jar`
-2. 将 JAR 文件放入服务器 `plugins/` 目录
+1. 下载 CI `latest` 滚动构建中的最新 `LetMeAsk-2.1.0-<commit-sha>.jar`
+2. 将 JAR 文件放入服务器 `plugins/` 目录（更新时先删除旧版重复 JAR，避免同名插件冲突）
 3. 重启服务器
 4. 编辑 `plugins/LetMeAsk/base.yml` 和 `questions.yml` 进行配置
 
@@ -36,15 +40,15 @@
 |------|------|------|
 | `/letmeask` 或 `/letmeask help`（简写 `/lma`） | 全员 | 帮助菜单（管理员额外显示管理命令） |
 | `/letmeask top [数量]` | 全员 | 答题排行榜（默认前 10，最多 20） |
-| `/letmeask stats [玩家名]` | 全员 | 查看答题统计（默认查自己） |
-| `/letmeask status` | 全员 | 查看插件状态 |
+| `/letmeask stats [玩家名]` | 全员（查他人需 `letmeask.stats.others`，默认 true） | 查看答题统计（默认查自己） |
+| `/letmeask status` | 全员（出资人账户与余额仅 `letmeask.admin` 可见） | 查看插件状态 |
 | `/letmeask start` | letmeask.admin | 启动定时出题 |
-| `/letmeask stop` | letmeask.admin | 停止定时出题 |
+| `/letmeask stop` | letmeask.admin | 停止定时出题（同时作废当前题目并解锁验证） |
 | `/letmeask question [force]` | letmeask.admin | 手动发布新题目 |
 | `/letmeask reload` | letmeask.admin | 重载配置文件 |
 
 所有子命令均支持简写 `/lma`（如 `/lma top`、`/lma stats`）。
-排行榜也会每小时在游戏内全局广播一次。
+排行榜会按 `leaderboard-broadcast` 配置定时在游戏内全局广播（默认每小时前 10 名，`enabled: false` 可关闭）。
 
 ## 配置
 
@@ -69,14 +73,36 @@ anti-bot-threshold-seconds: 1
 # 连续答对次数阈值，达到触发人机验证（0=禁用）
 anti-bot-correct-answer-threshold: 3
 
+# 防脚本枚举：窗口填满 N 条后，所有相邻间隔都低于该秒数才踢出（N=3~20；秒数 0=禁用）
+anti-bot-chat-history-count: 3
+anti-bot-chat-min-interval-seconds: 0.5
+
+# 人机验证服务不可用（未安装 HumanVerify）时的策略：
+#   deny  = 拒绝发奖并作废本轮（默认，防止脚本绕过验证刷奖励）
+#   award = 降级为直接发奖（旧行为，有脚本刷奖励风险）
+anti-bot-verify-unavailable: deny
+```
+
+只有最近 `N` 条消息组成完整窗口，且**每一对相邻消息**都快于阈值，才在玩家答对时踢人；只踢刷屏玩家，不会作废本轮题目。
+
+```yaml
 # 连击统计时间窗口（秒），超时未答对则连击清零
 anti-bot-streak-window-seconds: 300
 
 # 人机验证超时（秒），回调长时间未返回时自动解锁并作废本轮
 verify-timeout-seconds: 120
 
+# 资金不足暂停后，每隔多少秒复查一次出资人余额（最小 5 秒）
+balance-retry-seconds: 30
+
 # 答案模糊匹配阈值（0-1，越高越严格；1.0=精确匹配）
 fuzzy-similarity-threshold: 0.75
+
+# 定时广播排行榜（enabled=false 关闭；minutes 最小 1；count 最多 20）
+leaderboard-broadcast:
+  enabled: true
+  minutes: 60
+  count: 10
 
 # 答对庆祝：Title 只发给答对者，音效全服可听（sound=none 关闭音效）
 celebrate:
@@ -87,16 +113,93 @@ celebrate:
   volume: 1.0
   pitch: 1.0
 
+# 物品奖励：与金币叠加发放，背包满掉在脚下
+# random-one: true=每次随机其一，false=全发；name/lore/enchantments 可选
+items:
+  enabled: false
+  random-one: false
+  list:
+    - {material: DIAMOND, amount: 2}
+    - {material: GOLD_INGOT, amount: 1, name: "&6幸运金锭", lore: ["&7答题奖励"], enchantments: {luck: 1}}
+
 # 消息前缀
 messages:
   prefix: "&6[教育部]"
+  # ...（查询/管理/游戏流程/帮助/状态共 60+ 键，见 base.yml）
 ```
+
+### 展示通道（`broadcast-mode`）
+
+出题与答题流程的广播走哪条通道，默认 `chat`（聊天栏，与原行为一致）：
+
+```yaml
+broadcast-mode: chat   # chat / actionbar / title / both
+```
+
+| 值 | 效果 |
+|----|------|
+| `chat` | 聊天栏（默认） |
+| `actionbar` | 动作栏，题目存活期间**每秒重发**，不会 2~3 秒后就消失 |
+| `title` | 标题（大标题显示消息，副标题留空，停留 5 秒） |
+| `both` | 聊天栏 + 动作栏 |
+
+动作栏和标题是**数据包层直接发给客户端**的，不经过聊天管线，任何聊天类插件都拦不到。
+用途：主服装了 PlayerChat 之类的聊天插件，出现「**OP 能看到题目、普通玩家看不到**」时，
+把 `broadcast-mode` 改成 `actionbar` 或 `both` 就能绕开，无需改动别的插件。
+
+配置值非法时会告警并回退 `chat`，不会导致全服看不到消息。老服没有这个键也照常工作。
+
+⚠️ 动作栏宽度有限（约 60 字符），题目很长时会被截断，这种情况建议用 `both` 或 `title`。
+`title` 模式下「答错」这类单人反馈仍走动作栏，避免每次答错都全屏闪标题。
+Spigot 不支持 Paper 的原生动作栏 API 时，`actionbar` 会告警并自动回退聊天栏；`both` 则保留聊天栏消息。
+
+### 多语言（`language`）
+
+```yaml
+# zh=中文（默认），en=英文
+language: zh
+```
+
+设为 `en` 时所有文案读 `messages-en` 段（58 个键，与中文一一对应），
+缺键自动回退中文，所以老服升级无感——`messages-en` 整段缺失也能跑。
+`status` 页的是/否/运行中走 `common-yes/no/running/stopped/none` 通用键，同样中英切换。
+
+### messages 全键表
+
+所有用户可见文案都可在 `messages` 下自定义，支持 `&` 颜色码。
+占位符：`{arg}` 通用参数、`{arg2}` 第二参数、`{cmd}` 命令别名（如 `lma`，仅帮助菜单用）。
+
+| 键 | 说明 |
+|----|------|
+| `prefix` | 所有广播的前缀 |
+| `console-need-name` / `player-not-found` / `invalid-count` / `no-records` | 查询类提示 |
+| `unknown-command` / `no-permission` | 命令错误提示 |
+| `started` / `stopped` / `stopped-with-question` | 启停反馈 |
+| `question-posted` / `question-blocked` | 出题反馈 |
+| `reloaded` / `reloaded-empty` / `reload-dropped-verify` | 重载反馈 |
+| `kick-verify-timeout` / `kick-chat-too-fast` / `kick-verify-failed` | 踢人原因（显示在被踢画面） |
+| `announce-question` | 新题广播，`{arg}`=题目 |
+| `announce-funded` | 余额恢复广播，`{arg}`=余额、`{arg2}`=可奖励次数 |
+| `announce-verify-timeout-kick` / `announce-verify-timeout` | 验证超时广播 |
+| `announce-timeout` | 无人答对广播，`{arg}`=答案 |
+| `announce-chat-kick` | 刷屏踢人广播，`{arg}`=玩家名 |
+| `announce-verify-start` | 验证开始广播，`{arg}`=玩家名、`{arg2}`=原因 |
+| `announce-verify-failed` | 验证失败广播，`{arg}`=玩家名 |
+| `announce-win-no-vault` / `announce-win` / `announce-win-self` | 答对广播（无经济/零奖励/出资人自答），`{arg}`=玩家名 |
+| `announce-win-reward` | 正常发奖广播，`{arg}`=玩家名、`{arg2}`=金额 |
+| `announce-win-items` | 物品奖励后缀，`{arg}`=物品描述（如"2x Diamond"） |
+| `announce-paused-funds` | 资金不足暂停，`{arg}`=需用、`{arg2}`=当前 |
+| `announce-transfer-failed` / `announce-refunded` / `announce-refund-failed` | 转账失败相关，`{arg}`=错误信息 |
+| `help-*` | 帮助菜单 11 行，`{cmd}`=实际输入的别名 |
+| `status-*` | 状态页 7 行 |
+
+注意：老服 `base.yml` 不会被新默认值覆盖（`saveResource` 只写不存在的文件），缺键时走代码内置默认值。
 
 ### questions.yml
 
 ```yaml
 # 纯字符串格式：题目=答案（多答案用 | 分隔，答对任一即可）
-# map 格式：{q, a, weight}，权重越大越容易被抽中（默认 1）
+# map 格式：{q, a, weight}，权重越大越容易被抽中（默认 1，范围 1~10000）
 questions:
   - "中国首都=北京"
   - "2+2=4"
@@ -104,7 +207,38 @@ questions:
   - {q: "太阳系最大的行星是什么", a: "木星|Jupiter", weight: 2}
 ```
 
-统计数据保存在 `plugins/LetMeAsk/stats.yml`（累计出题/答对数、每人答对次数与奖金）。
+#### 题目/答案里带 `=` 或 `:`（转义）
+
+纯字符串格式靠分隔符切分题目与答案，分隔符取**第一个未被转义的 `=`**（没有 `=` 才用 `:`）。
+所以题目或答案本身要含这两个字符时，必须写成 `\=`、`\:`，`\\` 表示一个反斜杠：
+
+```yaml
+questions:
+  # 题目 = "2+2=4 这个等式成立吗"，答案 = "成立"
+  - '2+2\=4 这个等式成立吗=成立'
+  # 答案里带等号：题目 = "一元一次方程", 答案 = "x=1"
+  - '一元一次方程=x\=1'
+```
+
+⚠️ YAML 双引号里的反斜杠是转义符（`"\="` 会让整个 questions.yml 解析失败 → 插件回滚旧题库），
+所以**含 `\` 的条目请用单引号 `'...'` 或不加引号**。也可以用 map 格式，完全不需要转义：
+`{q: "2+2=4 这个等式成立吗", a: "成立"}`。
+
+### stats.yml（自动生成）
+
+```yaml
+total-asked: 1234        # 累计出题数
+total-answered: 567      # 累计答对数
+players:
+  <UUID>:
+    correct: 10          # 该玩家答对次数
+    earned: 500.0        # 该玩家累计奖金
+    name: "Steve"        # 最后已知玩家名（top 榜显示用）
+```
+
+30 秒增量落盘（无变更不写文件），约 5 分钟全量一次，关服时全量保存。
+手动改 `stats.yml` 后需 `/lma reload`？**不需要**——统计只在启动时加载，运行时改文件会被下次落盘覆盖。
+想清榜请停服后删文件再开服。
 
 ## 构建
 
@@ -114,11 +248,7 @@ questions:
 mvn clean package
 ```
 
-或使用 Gradle（依赖 `libs/` 目录下的本地 jar，可离线构建）：
-
-```bash
-gradle build
-```
+本项目统一使用 Maven 构建（`mvn clean package`）；仓库不再包含 Gradle 脚本或本地 jar。
 
 ### 版本管理
 
@@ -128,7 +258,32 @@ gradle build
 mvn clean package -Drevision=1.2.0
 ```
 
-CI 每次构建会自动追加 commit 短哈希（如 `1.1.0-a1b2c3d`），`latest` release 永远是最新构建。
+CI 每次构建会自动追加 commit 短哈希（如 `2.1.0-a1b2c3d`），`latest` release 永远是最新构建；旧构建产物会自动清理，只保留当前版本。
+
+详见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 常见问题
+
+**Q：没装 Vault/HumanVerify 能用吗？**
+A：能。无 Vault 时纯公告无奖励；无 HumanVerify 时默认在触发验证的那一刻拒绝发奖并作废本轮（`anti-bot-verify-unavailable: deny`），配置为 `award` 可恢复直接发奖。
+
+**Q：出了题没人答对怎么办？**
+A：`question-timeout-seconds` 超时后自动公布答案并出下一题，设 `0` 禁用超时。
+
+**Q：出题暂停了怎么恢复？**
+A：出资人余额不足时自动暂停，按 `balance-retry-seconds`（默认 30s）复查，充钱后自动恢复。余额恰好等于奖励时多留 1 美分再恢复，避免横跳。
+
+**Q：答对了没到账？**
+A：先看控制台有无"扣款失败/发放失败"日志。发放失败会自动退款；退款也失败会刷 severe 日志并公告"手动补账"，按日志里的出资人/玩家/金额手工处理。
+
+**Q：改了 base.yml 没生效？**
+A：改完执行 `/lma reload`。注意题库为空时 reload 整体回滚（旧配置不动），会提示"已保留旧题库与旧配置"。启动时若 `questions.yml` 题库为空，插件会禁用并报错，避免误用示例题发奖。
+
+**Q：排行榜是空的还每小时广播？**
+A：不会。空榜时定时广播自动跳过，手动 `/lma top` 仍提示"暂无答题记录"。
+
+**Q：玩家改名了统计会丢吗？**
+A：不会。统计 key 是 UUID，名只做显示；改名后下次答对自动更新。
 
 ## 许可证
 

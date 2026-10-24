@@ -16,6 +16,8 @@ import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
+import org.bstats.bukkit.Metrics;
+import org.bstats.charts.SimplePie;
 
 import java.io.File;
 import java.lang.reflect.Method;
@@ -23,88 +25,124 @@ import java.util.*;
 import java.util.logging.Level;
 
 /**
- * Quiz activity plugin (CubeX-compatible layout).
- * - Uses Vault for economy (recommended: CMI exposes Vault provider)
- * - Integrates with external HumanVerifyApi as in your example. If you have a different package
- *   for HumanVerifyApi, add the API dependency when compiling. If compilation fails, adjust imports
- *   to the correct package for your HumanVerify plugin.
+ * 抢答活动插件（CubeX 兼容布局）。
+ * - 经济走 Vault（推荐用 CMI 提供的 Vault 实现）。
+ * - 人机验证对接外部 HumanVerifyApi；若对方包名不同请自行调整。
+ *   注意不要把它们加进 pom 依赖，全部走反射调用以便优雅降级。
  */
 public class QuizPlugin extends JavaPlugin implements Listener {
-    // Vault economy provider (kept as Object to avoid compile-time dependency on Vault API)
-    private Object econ; // provider instance
-    // 缓存 Vault Economy 的 Class 与 Method：发奖一次最多触发 9 次反射查询，缓存后只剩 invoke
-    private Class<?> economyClass;
-    private final Map<String, Method> economyMethods = new HashMap<>();
+    // 子系统：经济桥接 / 答案匹配 / 消息中心（大重构拆出，主类只保留状态机与流程编排）
+    // 注意：EconomyBridge 构造需要 Logger，getLogger() 在字段初始化阶段不可用，onEnable 里再 new；
+    // Messages 持 baseCfg 的方法引用，lambda 在调用时才求值，不存在前向引用问题
+    EconomyBridge economy;
+    final QuestionMatcher matcher = new QuestionMatcher();
+    final Messages messages = new Messages(this::getBaseCfg);
+    HumanVerifyBridge humanVerify;
+    ItemRewards itemRewards;
 
     private final Random random = new Random();
 
-    // runtime state
+    // 运行时状态
     private volatile Question currentQuestion = null;
     private volatile boolean paused = false; // paused due to payer insufficient funds
     private volatile boolean verifying = false; // question locked while human verification pending
+    // 验证三字段跨线程读写：主线程写（判定/清理/超时tick），验证回调线程读（whenComplete 比对）；
+    // volatile 保证可见性，复合校验（epoch+player+题目id三重）在主线程 runTask 内完成
     private volatile java.util.UUID verifyingPlayer = null;
     private volatile long verifyStartMillis = 0L;
     private volatile long verifyEpoch = 0L; // 验证轮次：reload/force/超时解锁时自增，旧回调直接丢弃
     private volatile long nextPostAtMillis = 0L; // when the next question may be posted
     private volatile boolean economyAvailable = false;
-    private String economyProviderName = null;
-    private boolean economyBankSupport = true;
 
-    // config values
+    // 配置项缓存
+    // 注意：rewardAmount / balanceRetrySeconds / baseCfg 会被异步发奖线程与
+    // 异步聊天线程读取（reload 在主线程写），必须 volatile 保证可见性
     private String payerName;
-    private double rewardAmount;
+    private volatile double rewardAmount;
     private long questionIntervalSeconds;
     private long questionTimeoutSeconds;
     private double antiBotThresholdSeconds;
     private int antiBotCorrectAnswerThreshold;
     private long antiBotStreakWindowSeconds;
-    private int antiBotChatHistoryCount;
-    private double antiBotChatMinIntervalSeconds;
+    // 异步聊天线程会读 antiBotChat*/celebrate*（reload 在主线程写），加 volatile 保证可见性；
+    // 模糊阈值已搬进 QuestionMatcher（自带 volatile），主类不再持有
+    private volatile int antiBotChatHistoryCount;
+    private volatile double antiBotChatMinIntervalSeconds;
+    // 人机验证服务不可用（未安装 HumanVerify）时的策略：
+    // deny=拒绝发奖并作废本轮（默认，防止脚本绕过验证刷奖励）/ award=降级直接发奖（旧行为）
+    private volatile boolean denyWhenVerifyUnavailable = true;
+    // 答错反馈：只提示本人，可配置开关+冷却（防刷屏）；0=关闭
+    private volatile boolean wrongFeedbackEnabled = true;
+    private volatile long wrongFeedbackCooldownSeconds = 5L;
+    private final Map<java.util.UUID, Long> wrongFeedbackLast = new HashMap<>();
     private long verifyTimeoutSeconds;
-    private double fuzzySimilarityThreshold = 0.75; // default similarity threshold (0-1)
-    private boolean celebrateEnabled = true;
-    private String celebrateTitle = "§6§l答对了！";
-    private String celebrateSubtitle = "§e+{reward} 金币";
-    private String celebrateSound = "ENTITY_PLAYER_LEVELUP";
-    private float celebrateVolume = 1.0f;
-    private float celebratePitch = 1.0f;
+    private volatile long balanceRetrySeconds = 30L; // 暂停后每隔多少秒复查一次出资人余额（异步发奖线程也会读）
+    private volatile boolean balanceCheckInFlight = false; // 暂停态余额复查已在异步执行，避免重复查询
+    private volatile long nextBalanceCheckMillis = 0L;
+    // 人机验证桥接已搬进 HumanVerifyBridge（反射调用+降级+一次性告警+结果判定）
+    private boolean leaderboardBroadcastEnabled = true;
+    private long leaderboardBroadcastMinutes = 60L;
+    private int leaderboardBroadcastCount = 10;
+    private volatile boolean celebrateEnabled = true;
+    // 出题/答题广播的展示通道：chat=聊天栏（默认，原行为）/ actionbar=动作栏 / title=标题 / both=聊天栏+动作栏
+    // 动作栏与标题走数据包层直接发给客户端，不经过聊天管线，聊天类插件拦不到
+    private volatile String broadcastMode = "chat";
+    // 动作栏模式下当前题目那一行：动作栏 2~3 秒即消失，题目存活期间由 tick 每秒重发
+    private volatile String currentActionBarText = null;
+    // null=未探测；true=当前服务端支持 Paper 动作栏；false=动作栏不可用并降级聊天栏
+    private volatile Boolean actionBarSupported = null;
+    private volatile boolean actionBarWarningShown = false;
+    private volatile String celebrateTitle = "§6§l答对了！";
+    private volatile String celebrateSubtitle = "§e+{reward} 金币";
+    private volatile String celebrateSound = "ENTITY_PLAYER_LEVELUP";
+    private volatile float celebrateVolume = 1.0f;
+    private volatile float celebratePitch = 1.0f;
 
-    // resolved payer information (support UUID / OfflinePlayer / Server / LittleSkin via prefix)
-    private org.bukkit.OfflinePlayer payerOffline = null;
-    private boolean payerIsServer = false;
-    private boolean payerUsesUuid = false;
-    private String payerDisplay = null; // human readable identifier
+    // 出资人解析已搬进 EconomyBridge（resolvePayer/isPayer/getPayerDisplay）
 
-    // config files
+    // bStats 插件 id：在 https://bstats.org/what-is-my-plugin-id 注册后填入；<=0 时不初始化统计。
+    // bStats 类由 shade relocate 到 com.cubex.quiz.libs.bstats（见 pom），不会与其他插件的 bStats 冲突。
+    private static final int BSTATS_PLUGIN_ID = 0; // TODO: 注册后替换为真实 id
+
+    // 配置文件
     private File baseFile;
     private File questionsFile;
-    private FileConfiguration baseCfg;
-    private FileConfiguration questionsCfg;
+    // 异步聊天线程经 Messages 读 base.yml（reload 在主线程整体替换引用），需 volatile
+    private volatile FileConfiguration baseCfg;
 
-    // scheduler handle
+    /** 供 Messages 子系统惰性读取 base.yml 配置。 */
+    FileConfiguration getBaseCfg() {
+        return baseCfg;
+    }
+
+    // 定时任务句柄
     private BukkitTask tickerTask;
     private BukkitTask leaderboardTask;
     private BukkitTask statsSaveTask;
     private final Map<java.util.UUID, Integer> correctAnswerCounts = new HashMap<>();
     private final Map<java.util.UUID, Long> lastCorrectTimes = new HashMap<>();
-    private final Map<java.util.UUID, ChatHistory> recentChatMessages = new HashMap<>();
+    // 异步聊天线程按玩家并发读写：使用并发 Map，锁粒度收敛到单个 ChatHistory，
+    // 避免全服聊天共用一把锁造成串行化；clear()/remove() 可安全并发调用。
+    private final Map<java.util.UUID, ChatHistory> recentChatMessages = new java.util.concurrent.ConcurrentHashMap<>();
 
-    // 答题统计（持久化到 stats.yml，key 为玩家 UUID 字符串）
-    private File statsFile;
-    private FileConfiguration statsCfg;
-    private final Map<String, Integer> totalCorrect = new HashMap<>();
-    private final Map<String, Double> totalEarned = new HashMap<>();
-    private final Set<String> statsDirty = new HashSet<>(); // 自上次落盘后有变更的玩家 key
-    private final Map<String, String> nameCache = new HashMap<>(); // UUID 字符串 -> 最后已知玩家名（top 榜免查）
-    private volatile long totalAsked = 0L;
-    private volatile long totalAnswered = 0L;
+    // 答题统计已搬进 StatsStore（持久化到 stats.yml，key 为玩家 UUID 字符串；锁内部自持）
+    StatsStore stats;
+    // 答题专用锁：handleCorrectAnswer 不再用 synchronized 方法，避免占用插件 this 监视器
+    private final Object answerLock = new Object();
 
     @Override
     public void onEnable() {
-        // Ensure default resource files exist
+        // 释放默认配置文件（不存在时才写，不覆盖老服已有配置）
         saveResource("base.yml", false);
         saveResource("questions.yml", false);
-	
+
+        // 子系统必须先构造：loadConfigValues() 内部经 resolvePayer 转发到 economy，
+        // 构造在后会导致启动 NPE（拆分重构引入的回归）
+        economy = new EconomyBridge(getLogger());
+        humanVerify = new HumanVerifyBridge(getLogger());
+        stats = new StatsStore(getLogger(), getDataFolder());
+        itemRewards = new ItemRewards(getLogger());
+
         // load configuration files
         if (!loadConfigValues()) {
             getLogger().severe("启动时题库为空，禁用插件。请在 questions.yml 中添加题目后重启。");
@@ -116,9 +154,9 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         if (!economyAvailable) {
             getLogger().warning("未找到 Vault 经济插件：以“仅公告、无奖励”模式运行，安装 Vault 后请重启或重载插件");
         } else {
-            getLogger().info("已连接经济后端: " + (economyProviderName != null ? economyProviderName : "未知"));
-            if (payerIsServer && !economyBankSupport) {
-                getLogger().warning("经济后端 " + (economyProviderName != null ? economyProviderName : "未知")
+            getLogger().info("已连接经济后端: " + (economyProviderName() != null ? economyProviderName() : "未知"));
+            if (payerIsServer() && !economyBankSupport()) {
+                getLogger().warning("经济后端 " + (economyProviderName() != null ? economyProviderName() : "未知")
                         + " 未实现银行账户 API，将按账户名 \"" + payerName + "\" 扣款。"
                         + "请确保该账户存在且有余额，否则出题会因“资金不足”暂停；"
                         + "XConomy 可在 config.yml 开启 non-player-account 并给该账户充值。");
@@ -134,7 +172,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             getCommand("letmeask").setTabCompleter(quizCommand);
         }
 
-        // Start scheduler to post questions periodically (also checks paused state)
+        // 启动定时出题任务（同时处理暂停恢复检查）
         startTask();
 
         loadStats();
@@ -147,6 +185,14 @@ public class QuizPlugin extends JavaPlugin implements Listener {
                 saveStats(++runs % 10 != 0);
             }
         }.runTaskTimerAsynchronously(this, 600L, 600L);
+
+        // bStats 匿名统计：id 未注册（<=0）时跳过，不影响插件运行
+        if (BSTATS_PLUGIN_ID > 0) {
+            Metrics metrics = new Metrics(this, BSTATS_PLUGIN_ID);
+            // 自定义图表的 chart id 同样要在 bStats 后台注册后才会展示
+            metrics.addCustomChart(new SimplePie("broadcast_mode", () -> broadcastMode));
+            metrics.addCustomChart(new SimplePie("language", () -> messages.getLanguage()));
+        }
 
         getLogger().info("QuizPlugin enabled");
     }
@@ -166,110 +212,72 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         getLogger().info("QuizPlugin disabled");
     }
 
-    /** 从 stats.yml 加载累计统计。 */
+    // 统计读写转发到 StatsStore（渐进迁移：调用方不动，行为零变化）
     private void loadStats() {
-        statsFile = new File(getDataFolder(), "stats.yml");
-        statsCfg = YamlConfiguration.loadConfiguration(statsFile);
-        totalCorrect.clear();
-        totalEarned.clear();
-        nameCache.clear();
-        org.bukkit.configuration.ConfigurationSection players = statsCfg.getConfigurationSection("players");
-        if (players != null) {
-            for (String key : players.getKeys(false)) {
-                totalCorrect.put(key, players.getInt(key + ".correct", 0));
-                totalEarned.put(key, players.getDouble(key + ".earned", 0.0));
-                String n = players.getString(key + ".name");
-                if (n != null && !n.isEmpty()) nameCache.put(key, n);
-            }
-        }
-        totalAsked = statsCfg.getLong("total-asked", 0L);
-        totalAnswered = statsCfg.getLong("total-answered", 0L);
+        stats.load();
     }
 
-    /**
-     * 写回 stats.yml。incremental=true 时只写 dirty 玩家+累计计数（30s 高频任务用），
-     * false 时全量写回（5 分钟任务与关服时用）。
-     * 调用方注意线程：定时任务走异步，onDisable 走主线程。
-     */
-    private synchronized void saveStats(boolean incremental) {
-        if (statsCfg == null || statsFile == null) return;
-        try {
-            statsCfg.set("total-asked", totalAsked);
-            statsCfg.set("total-answered", totalAnswered);
-            if (incremental) {
-                if (statsDirty.isEmpty()) return; // 无变更时连文件都不碰
-                for (String uuid : statsDirty) {
-                    String key = "players." + uuid;
-                    statsCfg.set(key + ".correct", totalCorrect.getOrDefault(uuid, 0));
-                    statsCfg.set(key + ".earned", totalEarned.getOrDefault(uuid, 0.0));
-                    String n = nameCache.get(uuid);
-                    if (n != null) statsCfg.set(key + ".name", n);
-                }
-                statsDirty.clear();
-            } else {
-                for (Map.Entry<String, Integer> e : totalCorrect.entrySet()) {
-                    String key = "players." + e.getKey();
-                    statsCfg.set(key + ".correct", e.getValue());
-                    statsCfg.set(key + ".earned", totalEarned.getOrDefault(e.getKey(), 0.0));
-                    String n = nameCache.get(e.getKey());
-                    if (n != null) statsCfg.set(key + ".name", n);
-                }
-                statsDirty.clear();
-            }
-            statsCfg.save(statsFile);
-        } catch (Exception ex) {
-            getLogger().log(Level.WARNING, "保存 stats.yml 失败", ex);
-        }
+    private void saveStats(boolean incremental) {
+        stats.save(incremental);
     }
 
     /** 全量保存（关服与 5 分钟任务用）。 */
     private void saveStats() {
-        saveStats(false);
+        stats.save();
     }
 
-    /**
-     * 记录一次答对：累计次数与实发金额（0 奖励/自答/无 Vault 时金额为 0 也计数）。
-     * synchronized：awardWinner 走主线程，saveStats 走异步定时任务，需与保存互斥。
-     */
-    private synchronized void recordCorrect(Player player, double earned) {
-        String key = player.getUniqueId().toString();
-        totalCorrect.merge(key, 1, Integer::sum);
-        if (earned > 0.0) totalEarned.merge(key, earned, Double::sum);
-        else totalEarned.putIfAbsent(key, 0.0);
-        if (player.getName() != null) nameCache.put(key, player.getName());
-        statsDirty.add(key);
-        totalAnswered++;
+    private void recordCorrect(Player player, double earned) {
+        stats.recordCorrect(player, earned);
     }
 
-    /**
-     * UUID 反查最后已知玩家名：先读内存缓存，未命中再查 Bukkit（UUID 版走内存映射，不碰磁盘）。
-     * 仍无则回退显示 UUID 前 8 位。
-     * synchronized：top 命令可能与 recordCorrect/saveStats 并发读写 nameCache。
-     */
-    private synchronized String displayNameOf(String uuidKey) {
-        String cached = nameCache.get(uuidKey);
-        if (cached != null) return cached;
-        try {
-            org.bukkit.OfflinePlayer off = Bukkit.getOfflinePlayer(java.util.UUID.fromString(uuidKey));
-            if (off.getName() != null) {
-                nameCache.put(uuidKey, off.getName());
-                return off.getName();
-            }
-        } catch (IllegalArgumentException ignored) {}
-        return uuidKey.length() > 8 ? uuidKey.substring(0, 8) : uuidKey;
+    private String displayNameOf(String uuidKey) {
+        return stats.displayNameOf(uuidKey);
     }
 
-    /** 线程安全地缓存玩家名（sendStats 走命令线程，直接写 map 会与异步保存竞态）。 */
-    private synchronized void cacheName(String uuidKey, String name) {
-        if (uuidKey != null && name != null) nameCache.put(uuidKey, name);
+    private void cacheName(String uuidKey, String name) {
+        stats.cacheName(uuidKey, name);
     }
 
 
 
     /**
-     * 加载配置。题库解析到临时列表：新题库为空则保留旧题库并返回 false，
-     * 调用方据此决定是禁用插件（启动时）还是报错但继续运行（reload 时）。
+     * 加载配置。先验题库再应用 base.yml：题库为空则整体回滚（旧题库+旧配置都不动），
+     * 返回 false；调用方据此决定禁用插件（启动时）还是报错继续运行（reload 时）。
      */
+    /**
+     * 题库条目上限 20000：实测 15000 条解析约 0.4s、内存不足 1MB，
+     * 出题是 O(n) 求和但 15000 条单次仅约 0.5μs，匹配只针对当前题与聊天消息，
+     * 题库规模不影响热路径——上限提到 20000 留余量。
+     * 真正的炸弹是超大文件，另设 5MB 文件上限先拦截。
+     */
+    private static final int MAX_QUESTIONS = 20000;
+    private static final long MAX_QUESTIONS_FILE_BYTES = 5L * 1024 * 1024;
+    /** base.yml 体积上限：主线程同步解析，超大文件会卡启动/占内存（正常配置仅几十 KB）。 */
+    private static final long MAX_BASE_FILE_BYTES = 1L * 1024 * 1024;
+    /** 单题题目上限、单个候选答案上限及所有候选答案总长度上限。 */
+    private static final int MAX_QUESTION_LEN = 200;
+    private static final int MAX_ANSWER_LEN = 100;
+    private static final int MAX_ANSWERS_TOTAL_LEN = 500;
+
+    /**
+     * 数值配置消毒：YAML 支持 .nan/.inf，而 Math.max/min 拦不住 NaN
+     * （Math.max(0.0, NaN) 仍是 NaN），NaN 一旦进入经济调用会污染 Vault 余额。
+     * 非有限值回退默认值，再钳制到 [min, max]。
+     */
+    private static double saneDouble(double value, double def, double min, double max) {
+        if (!Double.isFinite(value)) value = def;
+        return Math.min(max, Math.max(min, value));
+    }
+
+    /** 长整数配置钳制：.nan 经 getLong 会变 0、.inf 会变 Long.MAX_VALUE，用区间兜住并防溢出。 */
+    private static long saneLong(long value, long min, long max) {
+        return Math.min(max, Math.max(min, value));
+    }
+
+    private static int saneInt(int value, int min, int max) {
+        return Math.min(max, Math.max(min, value));
+    }
+
     private boolean loadConfigValues() {
         // load base and questions from their own files
         baseFile = new File(getDataFolder(), "base.yml");
@@ -277,52 +285,48 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         try {
             if (!baseFile.exists()) saveResource("base.yml", false);
             if (!questionsFile.exists()) saveResource("questions.yml", false);
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            getLogger().log(Level.WARNING, "释放默认配置文件失败", e);
+        }
 
-        baseCfg = YamlConfiguration.loadConfiguration(baseFile);
-        questionsCfg = YamlConfiguration.loadConfiguration(questionsFile);
-        cachedPrefix = null; // base.yml 已重载，前缀缓存失效
-
-        payerName = baseCfg.getString("payer", "Server");
-        rewardAmount = Math.max(0.0, baseCfg.getDouble("reward", 50.0));
-        questionIntervalSeconds = Math.max(5L, baseCfg.getLong("question-interval-seconds", 60L));
-        questionTimeoutSeconds = Math.max(0L, baseCfg.getLong("question-timeout-seconds", 30L));
-        antiBotThresholdSeconds = Math.max(0.0, baseCfg.getDouble("anti-bot-threshold-seconds", 1.0));
-        antiBotCorrectAnswerThreshold = Math.max(0, baseCfg.getInt("anti-bot-correct-answer-threshold", 3));
-        antiBotStreakWindowSeconds = Math.max(0L, baseCfg.getLong("anti-bot-streak-window-seconds", 300L));
-        antiBotChatHistoryCount = Math.max(2, baseCfg.getInt("anti-bot-chat-history-count", 3));
-        antiBotChatMinIntervalSeconds = Math.max(0.0, baseCfg.getDouble("anti-bot-chat-min-interval-seconds", 0.5));
-        verifyTimeoutSeconds = Math.max(10L, baseCfg.getLong("verify-timeout-seconds", 120L));
-        fuzzySimilarityThreshold = Math.min(1.0, Math.max(0.0,
-                baseCfg.getDouble("fuzzy-similarity-threshold", fuzzySimilarityThreshold)));
-        celebrateEnabled = baseCfg.getBoolean("celebrate.enabled", true);
-        celebrateTitle = baseCfg.getString("celebrate.title", "§6§l答对了！");
-        celebrateSubtitle = baseCfg.getString("celebrate.subtitle", "§e+{reward} 金币");
-        celebrateSound = baseCfg.getString("celebrate.sound", "ENTITY_PLAYER_LEVELUP");
-        celebrateVolume = (float) Math.max(0.0, baseCfg.getDouble("celebrate.volume", 1.0));
-        celebratePitch = (float) Math.max(0.0, baseCfg.getDouble("celebrate.pitch", 1.0));
-
-        // resolve payer to a stable identifier (UUID/name/Server/LittleSkin)
-        resolvePayer(payerName);
-
-        // 条目可以是纯字符串（"题目=答案"，权重 1），也可以是 map（{q, a, weight}）
-        List<?> raw = questionsCfg.getList("questions");
-        boolean usingFallback = false;
-        if (raw == null || raw.isEmpty()) {
-            if (questions.isEmpty()) {
-                // 首次启动且无题库：用内置示例兜底
-                raw = Arrays.asList(
-                        "中国首都=北京",
-                        "2+2=4",
-                        "香蕉是什么颜色=黄色"
-                );
-                usingFallback = true;
-                getLogger().warning("questions.yml 中没有题目，使用内置示例题目。请在 questions.yml 中配置 questions 字段（格式：题目=答案）");
-            } else {
-                // reload 时新题库为空：保留旧题库，不中断运行
-                getLogger().warning("questions.yml 中没有可用题目，已保留旧题库（" + questions.size() + " 题）。请检查配置后重新 reload。");
+        FileConfiguration newBase;
+        FileConfiguration newQuestions;
+        try {
+            // 文件级熔断：超大 questions.yml / base.yml 直接拒载，避免 SnakeYAML 解析卡死主线程
+            if (questionsFile.exists() && questionsFile.length() > MAX_QUESTIONS_FILE_BYTES) {
+                getLogger().severe("questions.yml 过大（" + (questionsFile.length() / 1024 / 1024)
+                        + "MB，上限 5MB），已保留旧题库与旧配置。请拆分题库。");
                 return false;
             }
+            if (baseFile.exists() && baseFile.length() > MAX_BASE_FILE_BYTES) {
+                getLogger().severe("base.yml 过大（" + (baseFile.length() / 1024)
+                        + "KB，上限 1MB），已保留旧配置。请检查文件是否被误写或损坏。");
+                return false;
+            }
+            newBase = YamlConfiguration.loadConfiguration(baseFile);
+            newQuestions = YamlConfiguration.loadConfiguration(questionsFile);
+        } catch (Exception e) {
+            // YAML 语法损坏：整体回滚，保留旧配置继续运行（之前静默吞异常，服主无感知）
+            getLogger().log(Level.SEVERE, "配置文件 YAML 解析失败，已保留旧配置。请检查 base.yml/questions.yml 语法。", e);
+            return false;
+        }
+
+        // 先验题库：解析到临时列表，空则整体回滚（base.yml 字段与出资人都不动）
+        // 条目可以是纯字符串（"题目=答案"，权重 1），也可以是 map（{q, a, weight}）
+        List<?> raw = newQuestions.getList("questions");
+        if (raw != null && raw.size() > MAX_QUESTIONS) {
+            getLogger().warning("题库条目过多（" + raw.size() + "），仅加载前 " + MAX_QUESTIONS + " 条。");
+            raw = raw.subList(0, MAX_QUESTIONS);
+        }
+        if (raw == null || raw.isEmpty()) {
+            if (questions.isEmpty()) {
+                // 首次启动题库为空：拒绝启用，避免生产服误用内置示例题并发放真实奖励
+                getLogger().severe("questions.yml 中没有题目，插件将禁用。请配置 questions 字段（格式：题目=答案）后重启。");
+            } else {
+                // reload 时新题库为空：整体回滚，不中断运行
+                getLogger().warning("questions.yml 中没有可用题目，已保留旧题库与旧配置（" + questions.size() + " 题）。请检查配置后重新 reload。");
+            }
+            return false;
         }
 
         List<Question> parsed = parseQuestions(raw);
@@ -331,20 +335,76 @@ public class QuizPlugin extends JavaPlugin implements Listener {
                 getLogger().severe("没有可用题目，插件无法正常出题。请在 questions.yml 中添加题目。");
                 return false;
             }
-            getLogger().warning("新题库解析后为空，已保留旧题库（" + questions.size() + " 题）。");
+            getLogger().warning("新题库解析后为空，已保留旧题库与旧配置（" + questions.size() + " 题）。");
             return false;
         }
 
+        // 题库可用：提交新配置
+        baseCfg = newBase;
+        messages.invalidateCache(); // base.yml 已重载，前缀缓存失效
+        messages.setLanguage(baseCfg.getString("language", "zh")); // 语言开关：zh/en，其他值回退中文
+
+        payerName = baseCfg.getString("payer", "Server");
+        // 所有数值配置统一消毒：NaN/∞ 回退默认值，超范围钳制（防溢出与污染经济后端）
+        rewardAmount = saneDouble(baseCfg.getDouble("reward", 50.0), 50.0, 0.0, 1.0e9);
+        questionIntervalSeconds = saneLong(baseCfg.getLong("question-interval-seconds", 60L), 5L, 86400L);
+        questionTimeoutSeconds = saneLong(baseCfg.getLong("question-timeout-seconds", 30L), 0L, 86400L);
+        antiBotThresholdSeconds = saneDouble(baseCfg.getDouble("anti-bot-threshold-seconds", 1.0), 1.0, 0.0, 3600.0);
+        antiBotCorrectAnswerThreshold = saneInt(baseCfg.getInt("anti-bot-correct-answer-threshold", 3), 0, 1000);
+        antiBotStreakWindowSeconds = saneLong(baseCfg.getLong("anti-bot-streak-window-seconds", 300L), 0L, 31536000L);
+        antiBotChatHistoryCount = saneInt(baseCfg.getInt("anti-bot-chat-history-count", 3), 3, 20);
+        antiBotChatMinIntervalSeconds = saneDouble(baseCfg.getDouble("anti-bot-chat-min-interval-seconds", 0.5), 0.5, 0.0, 60.0);
+        String verifyUnavailable = baseCfg.getString("anti-bot-verify-unavailable", "deny");
+        if ("award".equalsIgnoreCase(verifyUnavailable)) {
+            denyWhenVerifyUnavailable = false;
+        } else if ("deny".equalsIgnoreCase(verifyUnavailable)) {
+            denyWhenVerifyUnavailable = true;
+        } else {
+            // 非法值回退到安全默认，避免一个错字悄悄关闭反作弊
+            denyWhenVerifyUnavailable = true;
+            getLogger().warning("anti-bot-verify-unavailable 配置无效（" + verifyUnavailable
+                    + "），已回退 deny。可选：award / deny");
+        }
+        wrongFeedbackEnabled = baseCfg.getBoolean("wrong-feedback.enabled", true);
+        wrongFeedbackCooldownSeconds = saneLong(baseCfg.getLong("wrong-feedback.cooldown-seconds", 5L), 0L, 86400L);
+        verifyTimeoutSeconds = saneLong(baseCfg.getLong("verify-timeout-seconds", 120L), 10L, 3600L);
+        balanceRetrySeconds = saneLong(baseCfg.getLong("balance-retry-seconds", 30L), 5L, 86400L);
+        matcher.setFuzzySimilarityThreshold(
+                baseCfg.getDouble("fuzzy-similarity-threshold", matcher.getFuzzySimilarityThreshold()));
+        leaderboardBroadcastEnabled = baseCfg.getBoolean("leaderboard-broadcast.enabled", true);
+        leaderboardBroadcastMinutes = saneLong(baseCfg.getLong("leaderboard-broadcast.minutes", 60L), 1L, 1440L);
+        leaderboardBroadcastCount = saneInt(baseCfg.getInt("leaderboard-broadcast.count", 10), 1, 20);
+        celebrateEnabled = baseCfg.getBoolean("celebrate.enabled", true);
+        celebrateTitle = baseCfg.getString("celebrate.title", "§6§l答对了！");
+        celebrateSubtitle = baseCfg.getString("celebrate.subtitle", "§e+{reward} 金币");
+        celebrateSound = baseCfg.getString("celebrate.sound", "ENTITY_PLAYER_LEVELUP");
+        celebrateVolume = (float) saneDouble(baseCfg.getDouble("celebrate.volume", 1.0), 1.0, 0.0, 10.0);
+        celebratePitch = (float) saneDouble(baseCfg.getDouble("celebrate.pitch", 1.0), 1.0, 0.0, 10.0);
+        // 展示通道：老服没有这个键时走默认 chat，行为与升级前完全一致
+        broadcastMode = normalizeBroadcastMode(baseCfg.getString("broadcast-mode", "chat"));
+        // 物品奖励：缺失/非法时内部整体禁用，不影响金币流程
+        if (itemRewards != null) itemRewards.load(baseCfg);
+
+        // resolve payer to a stable identifier (UUID/name/Server/LittleSkin)
+        resolvePayer(payerName);
+
         questions.clear();
         questions.addAll(parsed);
-        return !usingFallback || !questions.isEmpty();
+        return true;
+    }
+
+    /** 单题权重上限：防止极端配置下加权求和 int 溢出。 */
+    private static final int MAX_WEIGHT = 10000;
+
+    private static int clampWeight(int w) {
+        return Math.min(MAX_WEIGHT, Math.max(1, w));
     }
 
     /**
      * 解析题库条目。支持两种格式（可混用）：
      * <ul>
-     *   <li>纯字符串: "题目=答案1|答案2"，权重默认为 1</li>
-     *   <li>map: {q: "题目", a: "答案1|答案2", weight: 3}，weight 越大越容易被抽中（最小 1）</li>
+     *   <li>纯字符串: "题目=答案1|答案2"，权重默认为 1；题目/答案内含 = 或 : 时写成 \= 、\: 转义</li>
+     *   <li>map: {q: "题目", a: "答案1|答案2", weight: 3}，weight 越大越容易被抽中（1~10000）</li>
      * </ul>
      * 非法行与重复题目跳过。
      */
@@ -352,28 +412,43 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         List<Question> parsed = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         for (Object entry : raw) {
-            String line;
+            String q;
+            String a;
             int weight = 1;
             if (entry instanceof Map) {
                 Map<?, ?> map = (Map<?, ?>) entry;
                 Object qObj = map.get("q");
                 Object aObj = map.get("a");
                 if (qObj == null || aObj == null) continue;
-                line = qObj + "=" + aObj;
+                // map 格式直取 q/a：题目本身含 = 号时（如数学题）拼接再切分会切错
+                q = qObj.toString().trim();
+                a = aObj.toString().trim();
                 Object wObj = map.get("weight");
-                if (wObj instanceof Number) weight = Math.max(1, ((Number) wObj).intValue());
+                if (wObj instanceof Number) {
+                    weight = clampWeight(((Number) wObj).intValue());
+                } else if (wObj != null) {
+                    getLogger().warning("题目权重不是数字，已按 1 处理: " + q);
+                }
             } else if (entry instanceof String) {
-                line = (String) entry;
+                String line = (String) entry;
+                // 分隔符取第一个未被转义的 = 或 :（= 优先），\= / \: 视为题目或答案里的字面量
+                String[] parts = splitQALine(line);
+                if (parts == null) continue;
+                q = parts[0].trim();
+                a = parts[1].trim();
             } else {
                 continue;
             }
-            if (line == null) continue;
-            String[] parts = line.split("=", 2);
-            if (parts.length < 2) parts = line.split(":", 2);
-            if (parts.length < 2) continue;
-            String q = parts[0].trim();
-            String a = parts[1].trim();
             if (q.isEmpty() || a.isEmpty()) continue;
+            // 长度上限：超长条目跳过并告警，防恶意/误粘贴超长文本进全服广播
+            if (q.length() > MAX_QUESTION_LEN) {
+                getLogger().warning("题目过长（" + q.length() + " 字）已跳过: " + q.substring(0, 30) + "...");
+                continue;
+            }
+            if (a.length() > MAX_ANSWERS_TOTAL_LEN) {
+                getLogger().warning("题目答案过长已跳过: " + q);
+                continue;
+            }
             if (!seen.add(q)) {
                 getLogger().warning("题库存在重复题目，已跳过: " + q);
                 continue;
@@ -381,7 +456,12 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             List<String> answers = new ArrayList<>();
             for (String alt : a.split("\\|")) {
                 String t = alt.trim();
-                if (!t.isEmpty()) answers.add(t);
+                if (t.isEmpty()) continue;
+                if (t.length() > MAX_ANSWER_LEN) {
+                    getLogger().warning("答案过长（" + t.length() + " 字）已跳过: " + q);
+                    continue;
+                }
+                answers.add(t);
             }
             if (answers.isEmpty()) {
                 seen.remove(q);
@@ -390,6 +470,52 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             parsed.add(new Question(q, answers, weight));
         }
         return parsed;
+    }
+
+    /**
+     * 切分"题目=答案"行：取第一个<b>未被转义</b>的分隔符（= 优先，没有 = 才用 :）。
+     * 题目或答案本身含 = / : 时写成 \= / \:，解析后还原成字面量（\\ 还原成单个反斜杠）。
+     * 无分隔符返回 null。
+     */
+    /** 包级私有以便单测直接覆盖。 */
+    static String[] splitQALine(String line) {
+        int sepIndex = findUnescapedSeparator(line, '=');
+        if (sepIndex < 0) sepIndex = findUnescapedSeparator(line, ':');
+        if (sepIndex < 0) return null;
+        return new String[]{
+                unescapeQALine(line.substring(0, sepIndex)),
+                unescapeQALine(line.substring(sepIndex + 1))
+        };
+    }
+
+    /** 找第一个未被反斜杠转义的目标分隔符下标；被奇数个连续反斜杠前缀的视为转义。 */
+    private static int findUnescapedSeparator(String line, char target) {
+        for (int i = 0; i < line.length(); i++) {
+            if (line.charAt(i) != target) continue;
+            int backslashes = 0;
+            for (int j = i - 1; j >= 0 && line.charAt(j) == '\\'; j--) backslashes++;
+            if ((backslashes & 1) == 0) return i; // 偶数个反斜杠 = 未转义
+        }
+        return -1;
+    }
+
+    /** 还原转义：\= → =、\: → :、\\ → \；其他反斜杠原样保留（避免吞掉题目里的路径/LaTeX）。 */
+    private static String unescapeQALine(String s) {
+        if (s.indexOf('\\') < 0) return s;
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\\' && i + 1 < s.length()) {
+                char next = s.charAt(i + 1);
+                if (next == '\\' || next == '=' || next == ':') {
+                    sb.append(next);
+                    i++;
+                    continue;
+                }
+            }
+            sb.append(c);
+        }
+        return sb.toString();
     }
 
     private void startTask() {
@@ -410,28 +536,33 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     private void startLeaderboardTask() {
         if (leaderboardTask != null && !leaderboardTask.isCancelled()) {
             leaderboardTask.cancel();
+            leaderboardTask = null;
         }
-        long oneHourTicks = 60L * 60L * 20L;
+        if (!leaderboardBroadcastEnabled) return; // 关闭定时广播
+        long periodTicks = Math.max(1L, leaderboardBroadcastMinutes) * 60L * 20L;
+        final int count = Math.min(20, Math.max(1, leaderboardBroadcastCount));
         leaderboardTask = new BukkitRunnable() {
             @Override
             public void run() {
-                broadcastTop(10);
+                broadcastTop(count);
             }
-        }.runTaskTimer(this, oneHourTicks, oneHourTicks);
+        }.runTaskTimer(this, periodTicks, periodTicks);
     }
 
     private void broadcastTop(int count) {
+        // 空榜时跳过定时广播：手动 /top 仍提示“暂无记录”，但别每小时刷屏打扰玩家
+        if (stats.isEmpty()) return;
         List<String> messages = topMessages(count);
         for (Player player : Bukkit.getOnlinePlayers()) {
             for (String message : messages) {
-                player.sendMessage(message);
+                sendLegacy(player, message);
             }
         }
     }
 
     private List<String> topMessages(int count) {
-        List<Map.Entry<String, Integer>> sorted = new ArrayList<>(totalCorrect.entrySet());
-        sorted.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
+        // 排行快照由 StatsStore 提供（内部加锁拷贝，遍历无锁安全，防 CME）
+        List<Map.Entry<String, Integer>> sorted = stats.sortedSnapshot();
         if (sorted.isEmpty()) {
             return Collections.singletonList(msg("no-records", "&e暂无答题记录", null));
         }
@@ -442,26 +573,110 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         for (Map.Entry<String, Integer> entry : sorted) {
             if (++rank > count) break;
             messages.add(" §e" + rank + ". §f" + displayNameOf(entry.getKey()) + " §7答对 §f" + entry.getValue()
-                    + " §7奖金 §e" + String.format("%.2f", totalEarned.getOrDefault(entry.getKey(), 0.0)));
+                    + " §7奖金 §e" + String.format(Locale.ROOT, "%,.2f", stats.getEarned(entry.getKey())));
         }
         return messages;
     }
 
-    private volatile String cachedPrefix = null; // prefix 缓存：reload 时失效
-
+    // 消息转发到 Messages 子系统（渐进迁移：调用方不动，行为零变化）
     private String messagePrefix() {
-        String hit = cachedPrefix;
-        if (hit != null) return hit;
-        String prefix = baseCfg == null ? "&6[教育部]" : baseCfg.getString("messages.prefix", "&6[教育部]");
-        hit = prefix.replace('&', '§');
-        cachedPrefix = hit;
-        return hit;
+        return messages.prefix();
     }
 
-    // Keep Bukkit's legacy text APIs for compatibility with both Paper and Spigot.
+    // Bukkit 传统文本 API 兼容层，Paper 与 Spigot 通用。
+    // 全服广播按 broadcast-mode 分流：动作栏/标题是数据包层直发客户端，绕开聊天管线，
+    // 用于主服被聊天类插件过滤「只有 OP 能看到题目」的场景。
     @SuppressWarnings("deprecation")
     private void broadcastLegacy(String message) {
-        Bukkit.broadcastMessage(message);
+        String mode = broadcastMode;
+        if ("actionbar".equals(mode)) {
+            if (!broadcastActionBar(message)) Bukkit.broadcastMessage(message); // 不支持时安全降级
+        } else if ("title".equals(mode)) {
+            broadcastTitle(message);
+        } else if ("both".equals(mode)) {
+            Bukkit.broadcastMessage(message);
+            broadcastActionBar(message);
+        } else {
+            Bukkit.broadcastMessage(message); // chat：默认，行为与升级前一致
+        }
+    }
+
+    /** 标题停留/淡入淡出（ticks）：标题不需要每秒重发，够看完一眼即可。 */
+    private static final int TITLE_FADE_IN = 10;
+    private static final int TITLE_STAY = 100;   // 5 秒
+    private static final int TITLE_FADE_OUT = 20;
+
+    /**
+     * 全服动作栏。Paper 原生 API 不在 Spigot 上存在；探测失败时调用方回退聊天栏，
+     * 避免配置 actionbar 后玩家无声无息地什么都看不到。
+     */
+    @SuppressWarnings("deprecation")
+    private boolean broadcastActionBar(String message) {
+        if (!supportsActionBar()) return false;
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            try {
+                p.sendActionBar(message);
+            } catch (LinkageError e) {
+                actionBarSupported = false;
+                warnActionBarFallback(e);
+                return false;
+            } catch (Throwable ignored) {
+                // 单个玩家的发送失败不影响其他人
+            }
+        }
+        return true;
+    }
+
+    private boolean supportsActionBar() {
+        Boolean cached = actionBarSupported;
+        if (cached != null) return cached;
+        boolean supported;
+        try {
+            Player.class.getMethod("sendActionBar", String.class);
+            supported = true;
+        } catch (Throwable ignored) {
+            supported = false;
+        }
+        actionBarSupported = supported;
+        if (!supported) warnActionBarFallback(null);
+        return supported;
+    }
+
+    private void warnActionBarFallback(Throwable cause) {
+        if (actionBarWarningShown) return;
+        synchronized (this) {
+            if (actionBarWarningShown) return;
+            actionBarWarningShown = true;
+        }
+        String detail = cause == null ? "本服务端没有 Paper Player#sendActionBar API" : cause.toString();
+        getLogger().warning("动作栏当前不可用（" + detail + "），broadcast-mode=actionbar 将自动回退聊天栏；both 模式将只发聊天栏。");
+    }
+
+    /** 全服标题：消息作为大标题，副标题留空。 */
+    @SuppressWarnings("deprecation")
+    private void broadcastTitle(String message) {
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            try {
+                p.sendTitle(message, "", TITLE_FADE_IN, TITLE_STAY, TITLE_FADE_OUT);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /** 校验 broadcast-mode：非法值告警并回退 chat，避免一个错字导致全服看不到消息。 */
+    private String normalizeBroadcastMode(String raw) {
+        String value = raw == null ? "chat" : raw.trim().toLowerCase(Locale.ROOT);
+        switch (value) {
+            case "chat":
+            case "actionbar":
+            case "title":
+            case "both":
+                return value;
+            default:
+                getLogger().warning("broadcast-mode 配置无效（" + raw
+                        + "），已回退 chat。可选：chat / actionbar / title / both");
+                return "chat";
+        }
     }
 
     @SuppressWarnings("deprecation")
@@ -470,64 +685,43 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     }
 
     @SuppressWarnings("deprecation")
+    private void sendLegacy(Player player, String message) {
+        player.sendMessage(message);
+    }
+
+    @SuppressWarnings("deprecation")
     private void showLegacyTitle(Player player, String title, String subtitle) {
         player.sendTitle(title, subtitle);
     }
 
-    /** 可配置消息：读 messages.<key>，缺失用默认值；支持 & 颜色码与 {arg} 占位。 */
+    // 消息转发到 Messages 子系统（渐进迁移：调用方不动，行为零变化）
     private String msg(String key, String def, String arg) {
-        String s = baseCfg == null ? def : baseCfg.getString("messages." + key, def);
-        if (arg != null) s = s.replace("{arg}", arg);
-        return s.replace('&', '§');
+        return messages.msg(key, def, arg);
     }
 
+    private String msg2(String key, String def, String cmd, String arg) {
+        return messages.msg2(key, def, cmd, arg);
+    }
+
+    private String msg3(String key, String def, String cmd, String arg, String arg2) {
+        return messages.msg3(key, def, cmd, arg, arg2);
+    }
+
+    // 出资人解析转发到 EconomyBridge（渐进迁移：调用方不动，行为零变化）
     private void resolvePayer(String payer) {
-        payerOffline = null;
-        payerIsServer = false;
-        payerUsesUuid = false;
-        payerDisplay = payer;
-        if (payer == null) return;
-        if (payer.equalsIgnoreCase("server") || payer.equalsIgnoreCase("console")) {
-            payerIsServer = true;
-            payerDisplay = payer;
-            return;
-        }
-        // support littleskin:uuid or littleskin:name
-        if (payer.toLowerCase().startsWith("littleskin:")) {
-            String v = payer.substring(payer.indexOf(":") + 1);
-            try {
-                java.util.UUID uuid = java.util.UUID.fromString(v);
-                payerOffline = Bukkit.getOfflinePlayer(uuid);
-                payerDisplay = uuid.toString();
-                return;
-            } catch (IllegalArgumentException ignored) {
-                // fall through to name
-            }
-            payerOffline = Bukkit.getOfflinePlayer(v);
-            payerDisplay = payerOffline.getName() != null ? payerOffline.getName() : v;
-            return;
-        }
-        // try UUID
-        try {
-            java.util.UUID uuid = java.util.UUID.fromString(payer);
-            payerOffline = Bukkit.getOfflinePlayer(uuid);
-            payerUsesUuid = true;
-            payerDisplay = uuid.toString();
-            return;
-        } catch (IllegalArgumentException ignored) {
-        }
-        // fallback to name
-        payerOffline = Bukkit.getOfflinePlayer(payer);
-        payerDisplay = payerOffline.getName() != null ? payerOffline.getName() : payer;
+        economy.resolvePayer(payer);
     }
 
-    /** 判断答对者是否为出资人（UUID 优先，其次名字忽略大小写比对）。 */
     private boolean isPayer(Player player) {
-        if (player == null) return false;
-        if (payerIsServer) return false; // Server/Console 账户不可能是真实玩家
-        if (payerOffline != null && player.getUniqueId().equals(payerOffline.getUniqueId())) return true;
-        String name = player.getName();
-        return name != null && payerDisplay != null && name.equalsIgnoreCase(payerDisplay);
+        return economy.isPayer(player);
+    }
+
+    private String payerDisplay() {
+        return economy.getPayerDisplay();
+    }
+
+    private boolean payerIsServer() {
+        return economy.isPayerServer();
     }
 
     private void stopTask() {
@@ -555,11 +749,12 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         q.postTime = System.currentTimeMillis();
         q.id = java.util.UUID.randomUUID();
         currentQuestion = q;
-        synchronized (recentChatMessages) {
-            recentChatMessages.clear();
-        }
-        totalAsked++;
-        broadcastLegacy(messagePrefix() + " §f新题目: §f" + q.question);
+        recentChatMessages.clear();
+        stats.incrementAsked();
+        String line = messagePrefix() + msg("announce-question", " §f新题目: §f{arg}", q.question);
+        // 动作栏模式由 tick 每秒重发这一行，所以先把文本存下来
+        currentActionBarText = line;
+        broadcastLegacy(line);
     }
 
     /**
@@ -579,11 +774,12 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         return q != null ? q : questions.get(random.nextInt(questions.size()));
     }
 
-    /** 加权随机：权重越大越容易被抽中。 */
+    /** 加权随机：权重越大越容易被抽中（long 求和，极端题库也不溢出）。 */
     private Question pickWeighted() {
-        int total = 0;
+        long total = 0;
         for (Question q : questions) total += q.weight;
-        int r = random.nextInt(total);
+        if (total <= 0) return questions.get(questions.size() - 1);
+        long r = (random.nextLong() & Long.MAX_VALUE) % total;
         for (Question q : questions) {
             r -= q.weight;
             if (r < 0) return q;
@@ -591,58 +787,13 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         return questions.get(questions.size() - 1);
     }
 
-    /**
-     * 任一候选答案匹配即算答对。normalizedAnswers 为出题时预归一化的答案，
-     * 聊天消息只归一化一次，避免每条消息重复归一化题库答案。
-     */
+    // 答案匹配转发到 QuestionMatcher（渐进迁移：调用方不动，行为零变化）
     private boolean matchesAny(String providedNormalized, List<String> normalizedAnswers) {
-        if (providedNormalized == null || providedNormalized.isEmpty() || normalizedAnswers == null) return false;
-        for (String b : normalizedAnswers) {
-            if (b.isEmpty()) continue;
-            if (providedNormalized.equals(b)) return true;
-            if (fuzzySimilarityThreshold >= 1.0) continue; // 1.0 = 严格精确匹配
-            int max = Math.max(providedNormalized.length(), b.length());
-            // sim >= threshold  <=>  dist <= max * (1 - threshold)，上界早退
-            int maxDist = (int) Math.floor(max * (1.0 - fuzzySimilarityThreshold));
-            int dist = levenshtein(providedNormalized, b, maxDist);
-            if (dist <= maxDist) return true;
-        }
-        return false;
+        return matcher.matchesAny(providedNormalized, normalizedAnswers);
     }
-
-    /** 预编译：String.replaceAll 每次都编译 Pattern，高频聊天路径下不可接受。 */
-    private static final java.util.regex.Pattern NON_ALNUM = java.util.regex.Pattern.compile("[^\\p{L}\\p{N}]+");
 
     private static String normalize(String s) {
-        // Locale.ROOT：避免土耳其语等 locale 下 I/i 大小写转换异常
-        return s == null ? "" : NON_ALNUM.matcher(s).replaceAll("").toLowerCase(Locale.ROOT);
-    }
-
-    /**
-     * 带上界的编辑距离：若中途已能确定距离超过 maxDist，直接返回 maxDist+1。
-     * 调用方只关心“是否达标”，超标的精确值无意义，早退省掉剩余 DP 计算。
-     */
-    private int levenshtein(String s1, String s2, int maxDist) {
-        int n = s1.length();
-        int m = s2.length();
-        if (Math.abs(n - m) > maxDist) return maxDist + 1; // 长度差本身就是下界
-        int[] prev = new int[m + 1];
-        int[] curr = new int[m + 1];
-        for (int j = 0; j <= m; j++) prev[j] = j;
-        for (int i = 1; i <= n; i++) {
-            curr[0] = i;
-            int rowMin = curr[0];
-            for (int j = 1; j <= m; j++) {
-                int cost = s1.charAt(i - 1) == s2.charAt(j - 1) ? 0 : 1;
-                curr[j] = Math.min(Math.min(curr[j - 1] + 1, prev[j] + 1), prev[j - 1] + cost);
-                if (curr[j] < rowMin) rowMin = curr[j];
-            }
-            if (rowMin > maxDist) return maxDist + 1; // 整行都超标，后续只会更大
-            int[] tmp = prev;
-            prev = curr;
-            curr = tmp;
-        }
-        return prev[m];
+        return QuestionMatcher.normalize(s);
     }
 
     private final List<Question> questions = new ArrayList<>();
@@ -652,14 +803,39 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             // 降级模式：无 Vault 时不暂停出题逻辑，但 awardWinner 只发公告
             if (paused) paused = false;
         } else if (paused) {
-            // 暂停中：资金足额则恢复，否则等待
-            double bal = getBalanceOf(payerDisplay);
-            if (bal >= rewardAmount) {
-                paused = false;
-                broadcastLegacy(messagePrefix() + " §a资金已足额，恢复出题。当前余额: " + bal + "，预计还可以奖励" + (bal / rewardAmount) + "次。");
-            } else {
-                return;
-            }
+            // 暂停中：节流复查余额（默认 30 秒一次），避免每秒打一次 Vault 后端。
+            // 余额查询可能走数据库/网络，放异步执行，结果回主线程再决定是否恢复出题。
+            long nowMs = System.currentTimeMillis();
+            if (nowMs < nextBalanceCheckMillis || balanceCheckInFlight) return;
+            nextBalanceCheckMillis = nowMs + balanceRetrySeconds * 1000L;
+            balanceCheckInFlight = true;
+            final String payerSnap = payerDisplay();
+            Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+                final double bal;
+                try {
+                    bal = getBalanceOf(payerSnap);
+                } catch (Throwable t) {
+                    getLogger().log(Level.WARNING, "复查出资人余额失败", t);
+                    Bukkit.getScheduler().runTask(this, () -> balanceCheckInFlight = false);
+                    return;
+                }
+                Bukkit.getScheduler().runTask(this, () -> {
+                    balanceCheckInFlight = false;
+                    // 期间可能已被 reload/停止或其他路径恢复，重新确认暂停态
+                    if (!paused) return;
+                    // 恢复阈值加 1 美分滞后：余额恰好等于奖励时恢复后下一题又暂停，来回横跳刷屏
+                    if (bal >= rewardAmount + 0.01) {
+                        paused = false;
+                        String countText = rewardAmount > 0.0
+                                ? String.format(Locale.ROOT, "%,d", (long) (bal / rewardAmount))
+                                : "";
+                        broadcastLegacy(messagePrefix() + msg3("announce-funded",
+                                " §a资金已足额，恢复出题。当前余额: {arg}，预计还可以奖励{arg2}次。",
+                                null, String.format(Locale.ROOT, "%,.2f", bal), countText));
+                    }
+                });
+            });
+            return;
         }
 
         // 验证超时兜底：回调永不返回时解锁，避免永久锁死
@@ -667,13 +843,16 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             Player p = verifyingPlayer == null ? null : Bukkit.getPlayer(verifyingPlayer);
             long elapsedMillis = System.currentTimeMillis() - verifyStartMillis;
             if (elapsedMillis >= verifyTimeoutSeconds * 1000L) {
+                // 注意：先清连击再清题目，与验证失败/刷屏踢人分支一致；
+                // 否则被踢玩家重进后连击残留，下次答对直接再触发验证
+                if (verifyingPlayer != null) resetStreak(verifyingPlayer);
                 if (p != null) {
                     getLogger().warning(p.getName() + "人机验证超时（" + verifyTimeoutSeconds + "s），自动解锁作废本轮题目，并踢出玩家");
-                    broadcastLegacy(messagePrefix() + " §c玩家 " + p.getName() + " 因人机验证超时被踢出服务器，本轮题目作废。");
-                    kickLegacy(p, "人机验证超时");
+                    broadcastLegacy(messagePrefix() + msg("announce-verify-timeout-kick", " §c玩家 {arg} 因人机验证超时被踢出服务器，本轮题目作废。", p.getName()));
+                    kickLegacy(p, msg("kick-verify-timeout", "人机验证超时", null));
                 } else {
                     getLogger().warning("人机验证超时（" + verifyTimeoutSeconds + "s），玩家已离线，自动解锁并作废本轮题目");
-                    broadcastLegacy(messagePrefix() + " §c人机验证超时，本轮题目作废。");
+                    broadcastLegacy(messagePrefix() + msg("announce-verify-timeout", " §c人机验证超时，本轮题目作废。", null));
                 }
                 clearQuestionState();
             }
@@ -682,10 +861,15 @@ public class QuizPlugin extends JavaPlugin implements Listener {
 
         // 题目超时：公布答案、清空连击、安排下一题
         if (currentQuestion != null) {
+            // 动作栏 2~3 秒就消失，题目存活期间每秒重发，保证玩家随时能看题
+            if ("actionbar".equals(broadcastMode) || "both".equals(broadcastMode)) {
+                String text = currentActionBarText;
+                if (text != null) broadcastActionBar(text);
+            }
             if (questionTimeoutSeconds > 0) {
                 long elapsedMillis = System.currentTimeMillis() - currentQuestion.postTime;
                 if (elapsedMillis >= questionTimeoutSeconds * 1000L) {
-                    broadcastLegacy(messagePrefix() + " §c无人答对！答案是: §f" + currentQuestion.displayAnswer());
+                    broadcastLegacy(messagePrefix() + msg("announce-timeout", " §c无人答对！答案是: §f{arg}", currentQuestion.displayAnswer()));
                     correctAnswerCounts.clear();
                     lastCorrectTimes.clear();
                     clearQuestionState();
@@ -709,9 +893,8 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         verifyingPlayer = null;
         verifyStartMillis = 0L;
         verifyEpoch++;
-        synchronized (recentChatMessages) {
-            recentChatMessages.clear();
-        }
+        currentActionBarText = null; // 题目作废后不再重发动作栏
+        recentChatMessages.clear();
     }
 
     @EventHandler(ignoreCancelled = true)
@@ -721,62 +904,134 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         if (snapshot == null || verifying) return;
 
         String msg = event.getMessage().trim();
-        String normalizedMsg = normalize(msg);
         Player player = event.getPlayer();
         long messageTime = System.currentTimeMillis();
-        boolean correctAnswer = msg.length() <= 100 && matchesAny(normalizedMsg, snapshot.normalizedAnswers);
+
+        // 超长刷屏消息直接拒绝：仍计入聊天频率统计，但跳过归一化与模糊匹配
+        if (msg.length() > 100) {
+            recordChatMessage(player.getUniqueId(), snapshot.id, messageTime, false);
+            return;
+        }
+
+        String normalizedMsg = normalize(msg);
+        boolean correctAnswer = matchesAny(normalizedMsg, snapshot.normalizedAnswers);
         boolean chatTooFast = recordChatMessage(player.getUniqueId(), snapshot.id, messageTime, correctAnswer);
 
-        // 超长刷屏消息直接拒绝，避免无意义的模糊匹配计算
-        if (msg.length() > 100) return;
-
         if (correctAnswer) {
-            // 切主线程发奖，携带题目 id：若题目已轮换/作废则拒绝，防止旧题答案领走新题奖励
-            Bukkit.getScheduler().runTask(this, () -> handleCorrectAnswer(player, snapshot.id, chatTooFast));
+            // 切主线程发奖，携带题目 id：若题目已轮换/作废则拒绝，防止旧题答案领走新题奖励。
+            // 必须在调度前快照 id：Question 对象会在题库中复用，publishQuestion 会原地改写 id，
+            // lambda 里再读 snapshot.id 可能读到下一轮的值。
+            final java.util.UUID questionId = snapshot.id;
+            Bukkit.getScheduler().runTask(this, () -> handleCorrectAnswer(player, questionId, chatTooFast));
+        } else {
+            // 答错反馈：只提示本人（不广播），按冷却节流防刷屏
+            maybeWrongFeedback(player, messageTime);
+        }
+    }
+
+    /** 答错反馈：开关+冷却都在配置里，冷却内直接跳过。 */
+    private void maybeWrongFeedback(Player player, long messageTime) {
+        if (!wrongFeedbackEnabled) return;
+        long cooldownMillis = Math.max(0L, wrongFeedbackCooldownSeconds) * 1000L;
+        java.util.UUID uuid = player.getUniqueId();
+        synchronized (wrongFeedbackLast) {
+            Long last = wrongFeedbackLast.get(uuid);
+            if (last != null && messageTime - last < cooldownMillis) return;
+            wrongFeedbackLast.put(uuid, messageTime);
+        }
+        sendModeLegacy(player, messagePrefix() + msg("announce-wrong", " §c回答错误，再想想！", null));
+    }
+
+    /**
+     * 单人消息按展示通道分流：走动作栏/标题时聊天插件同样拦不到（答错提示等只发给本人的反馈）。
+     * 单人反馈一律用动作栏而非标题：答错很频繁，每次全屏闪标题太扰人。
+     */
+    @SuppressWarnings("deprecation")
+    private void sendModeLegacy(Player player, String message) {
+        String mode = broadcastMode;
+        if ("actionbar".equals(mode) || "title".equals(mode)) {
+            if (!sendActionBar(player, message)) sendLegacy(player, message);
+        } else if ("both".equals(mode)) {
+            sendLegacy(player, message);
+            sendActionBar(player, message);
+        } else {
+            sendLegacy(player, message);
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private boolean sendActionBar(Player player, String message) {
+        if (!supportsActionBar()) return false;
+        try {
+            player.sendActionBar(message);
+            return true;
+        } catch (LinkageError e) {
+            actionBarSupported = false;
+            warnActionBarFallback(e);
+            return false;
+        } catch (Throwable ignored) {
+            return false;
         }
     }
 
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
         // 玩家离线即清理连击记录，防止长期在线服 Map 无限增长
-        resetStreak(event.getPlayer().getUniqueId());
+        java.util.UUID uuid = event.getPlayer().getUniqueId();
+        resetStreak(uuid);
+        synchronized (wrongFeedbackLast) {
+            wrongFeedbackLast.remove(uuid);
+        }
+        // 被验证人退出：直接作废本轮（epoch 自增使旧回调失效），否则题目锁到验证超时
+        if (verifying && uuid.equals(verifyingPlayer)) {
+            clearQuestionState();
+        }
     }
 
     private boolean recordChatMessage(java.util.UUID playerId, java.util.UUID questionId, long messageTime,
                                       boolean correctAnswer) {
-        synchronized (recentChatMessages) {
-            ChatHistory history = recentChatMessages.get(playerId);
-            if (history == null || !history.questionId.equals(questionId)) {
-                history = new ChatHistory(questionId);
-                recentChatMessages.put(playerId, history);
-            }
+        // compute 原子地取用/替换本玩家的历史，再只锁该玩家的 ChatHistory
+        ChatHistory history = recentChatMessages.compute(playerId, (id, existing) ->
+                (existing == null || !Objects.equals(existing.questionId, questionId))
+                        ? new ChatHistory(questionId) : existing);
+        synchronized (history) {
             history.timestamps.addLast(messageTime);
             while (history.timestamps.size() > antiBotChatHistoryCount) {
                 history.timestamps.removeFirst();
             }
-            if (!correctAnswer || antiBotChatMinIntervalSeconds <= 0.0 || history.timestamps.size() < 2) {
+            // 必须先填满窗口，且所有相邻间隔都过短才判刷屏；避免两条快速纠正答案误踢。
+            if (!correctAnswer || antiBotChatMinIntervalSeconds <= 0.0
+                    || history.timestamps.size() < antiBotChatHistoryCount) {
                 return false;
             }
             long minimumIntervalMillis = (long) (antiBotChatMinIntervalSeconds * 1000.0);
             Long previous = null;
             for (Long timestamp : history.timestamps) {
-                if (previous != null && timestamp - previous < minimumIntervalMillis) return true;
+                if (previous != null && timestamp - previous >= minimumIntervalMillis) return false;
                 previous = timestamp;
             }
-            return false;
+            return true;
         }
     }
 
-    private synchronized void handleCorrectAnswer(Player player, java.util.UUID questionId, boolean chatTooFast) {
+    // 答题判定用专用 answerLock，不占用插件 this 监视器（之前 synchronized 方法会阻塞其他同步块）。
+    // 注意：判定→消耗必须在同一锁内原子完成，不可分段，否则两名玩家可同时通过判定导致重复发奖。
+    private void handleCorrectAnswer(Player player, java.util.UUID questionId, boolean chatTooFast) {
+        synchronized (answerLock) {
+            handleCorrectAnswerLocked(player, questionId, chatTooFast);
+        }
+    }
+
+    private void handleCorrectAnswerLocked(Player player, java.util.UUID questionId, boolean chatTooFast) {
         Question snapshot = currentQuestion;
         if (snapshot == null || verifying) return; // double-check
         if (snapshot.id == null || !snapshot.id.equals(questionId)) return; // 题目已轮换或作废
 
         if (chatTooFast) {
             resetStreak(player.getUniqueId());
-            clearQuestionState();
-            broadcastLegacy(messagePrefix() + " §c玩家 §f" + player.getName() + " §c因聊天消息间隔过短被踢出服务器。");
-            kickLegacy(player, "聊天消息间隔过短");
+            // 只踢刷屏者，不作废整题；否则单个脚本玩家可以通过触发反作弊破坏全服本轮活动。
+            broadcastLegacy(messagePrefix() + msg("announce-chat-kick", " §c玩家 §f{arg} §c因聊天消息间隔过短被踢出服务器。", player.getName()));
+            kickLegacy(player, msg("kick-chat-too-fast", "聊天消息间隔过短", null));
             return;
         }
 
@@ -797,104 +1052,97 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         boolean answeredTooOften = antiBotCorrectAnswerThreshold > 0
                 && correctAnswerCount >= antiBotCorrectAnswerThreshold;
 
-        // Invoke human verification for unusually fast or repeated correct answers.
+        // 答题过快或连续答对过多时触发人机验证
         if (answeredTooFast || answeredTooOften) {
-            verifying = true;
-            verifyingPlayer = player.getUniqueId();
-            verifyStartMillis = System.currentTimeMillis();
             Player p = player;
             String reason = answeredTooFast ? "答题速度过快" : "连续答对次数过多";
-            broadcastLegacy(messagePrefix() + " §c玩家 §f" + p.getName() + " §c"
-                    + reason + "，需要进行人机验证...");
 
-            // Try to call HumanVerifyApi as in provided snippet. This requires that the HumanVerify API
-            // is available at compile/runtime. If you use a different package, add the dependency.
-            try {
-                // 使用反射调用 HumanVerifyApi，避免将第三方实现打进本插件。
-                Class<?> apiClass = Class.forName("org.cubexmc.humanverify.api.HumanVerifyApi");
-                Object api = Bukkit.getServicesManager().load(apiClass);
-                if (api != null) {
-                    Object future = null;
-                    try {
-                        future = apiClass.getMethod("requestVerification", org.bukkit.entity.Player.class, boolean.class)
-                                .invoke(api, p, true);
-                    } catch (NoSuchMethodException nsme) {
-                        getLogger().warning("HumanVerifyApi 没有 requestVerification(Player, boolean) 方法，验证失败，不发放奖励。");
+            // 验证调用已搬进 HumanVerifyBridge：反射+降级+一次性告警都在内部处理；
+            // 返回 null 表示服务不可用，调用方直接发奖。注意 verifying 锁与广播放在
+            // 确认 future 有效之后，缺失时不打扰玩家。
+            Object future = humanVerify.requestVerification(p);
+
+            if (future == null) {
+                // 验证服务不可用：默认拒绝发奖，防止脚本用“答得快/连对多”绕过验证刷奖励。
+                // anti-bot-verify-unavailable=award 可恢复旧行为（降级直接发奖）。
+                // 注意：必须先消耗本题，否则题目残留可被无限次答对领奖
+                clearQuestionState();
+                if (denyWhenVerifyUnavailable) {
+                    getLogger().warning(p.getName() + " 触发人机验证但验证服务不可用，本轮按 deny 策略不予发奖");
+                    sendModeLegacy(p, messagePrefix() + msg("announce-verify-unavailable",
+                            " §c人机验证服务不可用，本轮答案不予发奖。", null));
+                } else {
+                    awardWinner(p);
+                }
+            } else {
+                verifying = true;
+                verifyingPlayer = player.getUniqueId();
+                verifyStartMillis = System.currentTimeMillis();
+                broadcastLegacy(messagePrefix() + msg3("announce-verify-start", " §c玩家 §f{arg} §c{arg2}，需要进行人机验证...", null, p.getName(), reason));
+                java.util.UUID targetPlayer = p.getUniqueId();
+                java.util.UUID targetQuestion = snapshot.id;
+                long targetEpoch = verifyEpoch;
+                // whenComplete 而非 thenAccept：future 异常完成时 thenAccept 永不触发，
+                // verifying 会锁死到超时兜底；异常视为验证服务故障，降级直接发奖
+                ((java.util.concurrent.CompletableFuture<?>) future).whenComplete((result, ex) -> {
+                    if (ex != null) {
+                        getLogger().log(Level.WARNING, "人机验证 future 异常完成，跳过验证直接发奖", ex);
+                        Bukkit.getScheduler().runTask(this, () -> {
+                            if (targetEpoch != verifyEpoch) return;
+                            if (!verifying || !targetPlayer.equals(verifyingPlayer)) return;
+                            Player live = Bukkit.getPlayer(targetPlayer);
+                            resetStreak(targetPlayer);
+                            clearQuestionState();
+                            if (live == null) return; // 验证期间已退服：只清状态，不发奖
+                            awardWinner(live);
+                        });
+                        return;
                     }
+                    try {
+                        // 结果判定已搬进 HumanVerifyBridge：枚举名 SUCCESS 或 toString 为 SUCCESS 即通过
+                        final boolean passed = humanVerify.isPassed(result);
 
-                    if (future instanceof java.util.concurrent.CompletableFuture) {
-                        java.util.UUID targetPlayer = p.getUniqueId();
-                        java.util.UUID targetQuestion = snapshot.id;
-                        long targetEpoch = verifyEpoch;
-                        ((java.util.concurrent.CompletableFuture<?>) future).thenAccept(result -> {
-                            try {
-                                // 通过比较枚举名称判断是否为 SUCCESS
-                                boolean ok = false;
-                                try {
-                                    java.lang.reflect.Method nameM = result.getClass().getMethod("name");
-                                    String nm = (String) nameM.invoke(result);
-                                    ok = "SUCCESS".equals(nm);
-                                } catch (Exception e) {
-                                    // fallback to toString
-                                    ok = "SUCCESS".equals(result.toString());
+                        Bukkit.getScheduler().runTask(this, () -> {
+                            // 若已超时兜底/题目轮换/reload/force，直接丢弃过期回调
+                            if (targetEpoch != verifyEpoch) return;
+                            if (!verifying || !targetPlayer.equals(verifyingPlayer)) return;
+                            Question cur = currentQuestion;
+                            if (cur == null || cur.id == null || !cur.id.equals(targetQuestion)) return;
+
+                            if (passed) {
+                                Player live = Bukkit.getPlayer(targetPlayer);
+                                resetStreak(targetPlayer);
+                                clearQuestionState();
+                                if (live == null) return; // 验证期间已退服：只清状态，不发奖
+                                awardWinner(live);
+                            } else {
+                                // 失败分支同样重新查活：闭包 p 可能是验证期间已退服的过期引用，
+                                // 对离线引用 kick 会抛异常，用查活后的 live 才安全
+                                Player live = Bukkit.getPlayer(targetPlayer);
+                                resetStreak(targetPlayer);
+                                clearQuestionState();
+                                if (live != null) {
+                                    broadcastLegacy(messagePrefix() + msg("announce-verify-failed", " §c玩家 §f{arg} §c未通过人机验证，已被踢出服务器。", live.getName()));
+                                    kickLegacy(live, msg("kick-verify-failed", "未通过人机验证", null));
                                 }
-                                final boolean passed = ok;
-
-                                Bukkit.getScheduler().runTask(this, () -> {
-                                    // 若已超时兜底/题目轮换/reload/force，直接丢弃过期回调
-                                    if (targetEpoch != verifyEpoch) return;
-                                    if (!verifying || !targetPlayer.equals(verifyingPlayer)) return;
-                                    Question cur = currentQuestion;
-                                    if (cur == null || cur.id == null || !cur.id.equals(targetQuestion)) return;
-
-                                    if (passed) {
-                                        if (!p.isOnline()) {
-                                            resetStreak(targetPlayer);
-                                            clearQuestionState();
-                                            return;
-                                        }
-                                        resetStreak(targetPlayer);
-                                        clearQuestionState();
-                                        awardWinner(p);
-                                    } else {
-                                        resetStreak(targetPlayer);
-                                        clearQuestionState();
-                                        broadcastLegacy(messagePrefix() + " §c玩家 §f" + p.getName() + " §c未通过人机验证，已被踢出服务器。");
-                                        kickLegacy(p, "未通过人机验证");
-                                    }
-                                });
-                            } catch (Throwable t) {
-                                getLogger().log(Level.SEVERE, "处理人机验证结果时出错", t);
-                                Bukkit.getScheduler().runTask(this, () -> {
-                                    resetStreak(p.getUniqueId());
-                                    clearQuestionState();
-                                });
                             }
                         });
-                    } else {
-                        getLogger().warning("HumanVerifyApi.requestVerification 未返回 CompletableFuture 或返回 null，验证失败，不发放奖励");
-                        resetStreak(p.getUniqueId());
-                        clearQuestionState();
+                    } catch (Throwable t) {
+                        getLogger().log(Level.SEVERE, "处理人机验证结果时出错", t);
+                        Bukkit.getScheduler().runTask(this, () -> {
+                            // 用 targetPlayer 而非闭包 p：p 是答对瞬间的引用，回调延迟执行时已过期
+                            resetStreak(targetPlayer);
+                            clearQuestionState();
+                        });
                     }
-                } else {
-                    getLogger().warning("未能通过 ServicesManager 加载 HumanVerifyApi，验证失败，不发放奖励。");
-                    resetStreak(p.getUniqueId());
-                    clearQuestionState();
-                }
-            } catch (ClassNotFoundException cnf) {
-                getLogger().warning("HumanVerifyApi 类未找到，无法执行人机验证。请确认 HumanVerify 已安装并先于本插件加载。");
-                resetStreak(p.getUniqueId());
-                clearQuestionState();
-            } catch (Throwable t) {
-                getLogger().log(Level.SEVERE, "调用人机验证 API 时出错，验证失败，不发放奖励", t);
-                resetStreak(p.getUniqueId());
-                clearQuestionState();
+                });
+                // else 分支结束：验证回调已挂接，后续由回调或超时兜底解锁
             }
 
             return;
         }
 
-        // Normal awarding — 注意：这里不能 resetStreak，否则连击永远累积不到阈值，
+        // 正常发奖——注意：这里不能 resetStreak，否则连击永远累积不到阈值，
         // anti-bot-correct-answer-threshold 将形同虚设。连击只靠时间窗口衰减/超时/验证/退出清理。
         clearQuestionState();
         awardWinner(player);
@@ -904,9 +1152,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     private void resetStreak(java.util.UUID uuid) {
         correctAnswerCounts.remove(uuid);
         lastCorrectTimes.remove(uuid);
-        synchronized (recentChatMessages) {
-            recentChatMessages.remove(uuid);
-        }
+        recentChatMessages.remove(uuid);
     }
 
     /**
@@ -916,7 +1162,7 @@ public class QuizPlugin extends JavaPlugin implements Listener {
     private void celebrate(Player winner, double earned) {
         if (!celebrateEnabled) return;
         try {
-            String sub = celebrateSubtitle.replace("{reward}", String.format("%.0f", earned));
+            String sub = celebrateSubtitle.replace("{reward}", String.format(Locale.ROOT, "%,.2f", earned));
             if (earned <= 0.0) sub = "";
             showLegacyTitle(winner, celebrateTitle.replace('&', '§'), sub.replace('&', '§'));
         } catch (Throwable t) {
@@ -924,393 +1170,410 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         }
         if (celebrateSound == null || celebrateSound.isEmpty() || "none".equalsIgnoreCase(celebrateSound)) return;
         try {
-            org.bukkit.Sound sound = org.bukkit.Sound.valueOf(celebrateSound.toUpperCase(Locale.ROOT));
+            org.bukkit.Sound sound = resolveSound(celebrateSound);
+            if (sound == null) {
+                getLogger().warning("celebrate.sound 配置无效或服务端不支持: " + celebrateSound + "，已跳过音效");
+                celebrateSound = "none";
+                return;
+            }
             for (Player p : Bukkit.getOnlinePlayers()) {
                 try {
-                    p.playSound(p.getLocation(), sound, celebrateVolume, celebratePitch);
+                    // 走 MASTER 通道：不受玩家环境音量设置影响，保证庆祝音效可听
+                    p.playSound(p.getLocation(), sound, org.bukkit.SoundCategory.MASTER, celebrateVolume, celebratePitch);
+                } catch (LinkageError e) {
+                    throw e; // 新旧 Bukkit API 链接失败交给外层关闭音效并告警
                 } catch (Throwable ignored) {}
             }
-        } catch (IllegalArgumentException e) {
-            getLogger().warning("celebrate.sound 配置无效: " + celebrateSound + "，已跳过音效");
-            celebrateSound = "none"; // 避免每题刷一次告警
+        } catch (Throwable t) {
+            // 新版 Bukkit 将 Sound 从 enum 调整为接口；不兼容时只关闭音效，绝不打断发奖流程
+            getLogger().warning("celebrate.sound 当前服务端不兼容: " + t.getClass().getSimpleName()
+                    + "，已跳过音效");
+            celebrateSound = "none";
         }
     }
+
+    /**
+     * 兼容 enum 与新版接口常量：两者都暴露同名 public static 字段。
+     * 不直接链接旧版 enum 的 valueOf，避免新版服务端在链接阶段抛 NoSuchMethodError。
+     */
+    private org.bukkit.Sound resolveSound(String configuredName) {
+        String name = configuredName.trim().toUpperCase(Locale.ROOT);
+        try {
+            Object value = org.bukkit.Sound.class.getField(name).get(null);
+            if (value instanceof org.bukkit.Sound) return (org.bukkit.Sound) value;
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /**
+     * 发放物品奖励（与金币叠加）：配置未启用直接返回空串；
+     * 启用则 roll+give，返回可追加到广播的后缀（如“，另获 2x Diamond”），无后缀返回空串。
+     * 背包满掉脚下，由 ItemRewards 内部处理。
+     */
+    private String giveItems(Player winner) {
+        if (itemRewards == null || !itemRewards.isEnabled()) return "";
+        java.util.List<org.bukkit.inventory.ItemStack> items = itemRewards.roll();
+        if (items.isEmpty()) return "";
+        itemRewards.give(winner, items);
+        // 广播按实际 roll 出的物品描述，保证与实发一致（random-one 不再写死"随机物品"）
+        String desc = itemRewards.describe(items);
+        if (desc.isEmpty()) return "";
+        return msg("announce-win-items", "，另获 {arg}", desc);
+    }
+
+    // 发奖转账串行锁：经济后端可能带磁盘/网络 IO（数据库类经济插件），转账放异步线程执行，
+    // 两笔奖金的“余额检查→扣款→到账”用它串行化，防止交错扣款。answerLock 只负责答题判定，不等待 IO。
+    private final Object awardLock = new Object();
 
     private void awardWinner(Player winner) {
         // 无 Vault 时降级为纯公告模式，不暂停出题
         if (!economyAvailable) {
             recordCorrect(winner, 0.0);
-            broadcastLegacy(messagePrefix() + " §a玩家 §f" + winner.getName() + " §a答对了问题！§7（未安装 Vault，本轮无货币奖励）");
+            broadcastLegacy(messagePrefix() + msg("announce-win-no-vault", " §a玩家 §f{arg} §a答对了问题！§7（未安装 Vault，本轮无货币奖励）", winner.getName()) + giveItems(winner));
             celebrate(winner, 0.0);
             return;
         }
         // 奖励为 0：跳过全部转账调用，直接公告
         if (rewardAmount <= 0.0) {
             recordCorrect(winner, 0.0);
-            broadcastLegacy(messagePrefix() + " §a玩家 §f" + winner.getName() + " §a答对了问题！");
+            broadcastLegacy(messagePrefix() + msg("announce-win", " §a玩家 §f{arg} §a答对了问题！", winner.getName()) + giveItems(winner));
             celebrate(winner, 0.0);
             return;
         }
         // 答对者就是出资人：左手倒右手，跳过转账
         if (isPayer(winner)) {
             recordCorrect(winner, 0.0);
-            broadcastLegacy(messagePrefix() + " §a玩家 §f" + winner.getName() + " §a答对了问题！§7（出资人自答，无需转账）");
+            broadcastLegacy(messagePrefix() + msg("announce-win-self", " §a玩家 §f{arg} §a答对了问题！§7（出资人自答，无需转账）", winner.getName()) + giveItems(winner));
             celebrate(winner, 0.0);
             return;
         }
-        // Check payer balance
-        double payerBal = getBalanceOf(payerDisplay);
+        // 经济转账切异步执行（见 awardLock 注释），结果回主线程落地广播/庆祝/统计；
+        // 调度器保证主线程此前对出资人/经济配置的写入对异步任务可见。
+        // 已知代价：插件恰好在这个窗口关闭时，挂起的异步转账会被取消，该次奖励丢失。
+        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
+            AwardOutcome outcome;
+            synchronized (awardLock) {
+                outcome = transferReward(winner);
+            }
+            Bukkit.getScheduler().runTask(this, () -> finishAward(winner, outcome));
+        });
+    }
+
+    /** 转账结果类型：由异步线程判定，带回主线程选择广播。 */
+    private enum AwardKind {
+        /** 出资人余额不足，暂停出题。 */
+        PAUSED_NO_FUNDS,
+        /** 扣款失败，暂停出题。 */
+        WITHDRAW_FAILED,
+        /** 发放失败但已成功退款。 */
+        REFUNDED,
+        /** 发放失败且退款失败，需人工补账。 */
+        REFUND_FAILED,
+        /** 转账完成。 */
+        SUCCESS
+    }
+
+    /** 一次转账的结果快照：由异步线程产出，主线程只按结果广播。 */
+    private record AwardOutcome(AwardKind kind, String error, String refundError, double payerBalance) {}
+
+    /** 出资人扣款 → 玩家到账 → 失败退款的转账主体。须持 awardLock 调用；暂停标记在判定处直接落位。 */
+    private AwardOutcome transferReward(Player winner) {
+        double payerBal = getBalanceOf(payerDisplay());
         if (payerBal < rewardAmount) {
-            paused = true;
-            broadcastLegacy(messagePrefix() + " §c出题已暂停：资金不足（需要 " + rewardAmount + "，当前 " + payerBal + "）。");
-            return;
+            pauseAward();
+            return new AwardOutcome(AwardKind.PAUSED_NO_FUNDS, null, null, payerBal);
         }
-
-        Object w = withdrawFrom(payerDisplay, rewardAmount);
+        Object w = withdrawFrom(payerDisplay(), rewardAmount);
         if (!isEconomyResponseSuccess(w)) {
-            paused = true;
-            String err = getEconomyResponseError(w);
-            broadcastLegacy(messagePrefix() + " §c转账失败（错误: " + err + "），出题已暂停。请检查服务器日志。" );
-            getLogger().warning("扣款失败: " + err);
-            return;
+            pauseAward();
+            return new AwardOutcome(AwardKind.WITHDRAW_FAILED, getEconomyResponseError(w), null, payerBal);
         }
-
         Object d = depositTo(winner, rewardAmount);
         if (!isEconomyResponseSuccess(d)) {
-            // refund payer if possible
+            // refund payer if possible（必须走对称通道，否则 Server/UUID 出资时钱退错地方）
             String err = getEconomyResponseError(d);
             getLogger().warning("发放给胜利玩家失败: " + err + "。尝试退款。");
-            depositTo(payerDisplay, rewardAmount);
-            broadcastLegacy(messagePrefix() + " §c发放奖励失败，已退款，请联系管理员。错误: " + err);
-            return;
+            Object refund = refundToPayer(rewardAmount);
+            if (isEconomyResponseSuccess(refund)) {
+                return new AwardOutcome(AwardKind.REFUNDED, err, null, payerBal);
+            }
+            return new AwardOutcome(AwardKind.REFUND_FAILED, err, getEconomyResponseError(refund), payerBal);
         }
-
-        recordCorrect(winner, rewardAmount);
-        broadcastLegacy(messagePrefix() + " §a玩家 §f" + winner.getName() + " §a答对了问题，获得 §e" + rewardAmount + " §a货币！");
-        celebrate(winner, rewardAmount);
+        return new AwardOutcome(AwardKind.SUCCESS, null, null, payerBal);
     }
 
+    /** 转账失败即暂停出题，并在判定当下定好复查时间（volatile 字段，异步写主线程读安全）。 */
+    private void pauseAward() {
+        paused = true;
+        nextBalanceCheckMillis = System.currentTimeMillis() + balanceRetrySeconds * 1000L;
+    }
+
+    /** 转账结果落地（主线程）：广播 + 成功时的统计/物品/庆祝。 */
+    private void finishAward(Player winner, AwardOutcome o) {
+        switch (o.kind()) {
+            case PAUSED_NO_FUNDS -> broadcastLegacy(messagePrefix() + msg3("announce-paused-funds",
+                    " §c出题已暂停：资金不足（需要 {arg}，当前 {arg2}）。", null,
+                    String.format(Locale.ROOT, "%,.2f", rewardAmount),
+                    String.format(Locale.ROOT, "%,.2f", o.payerBalance())));
+            case WITHDRAW_FAILED -> {
+                broadcastLegacy(messagePrefix() + msg("announce-transfer-failed", " §c转账失败（错误: {arg}），出题已暂停。请检查服务器日志。", o.error()));
+                getLogger().warning("扣款失败: " + o.error());
+            }
+            case REFUNDED -> broadcastLegacy(messagePrefix() + msg("announce-refunded", " §c发放奖励失败，已退款，请联系管理员。错误: {arg}", o.error()));
+            case REFUND_FAILED -> {
+                // 退款失败：出资人已被扣款，玩家未到账，必须人工介入，不能谎称已退款
+                // 日志脱敏：玩家名只留 UUID 前 8 位用于对账，不记全名；金额保留（补账必需）
+                String uuidShort = winner.getUniqueId().toString().substring(0, 8);
+                getLogger().severe("退款失败！出资人 " + payerDisplay() + " 已被扣 " + rewardAmount
+                        + "，玩家[" + uuidShort + "]未到账。请手动补账。发放错误: " + o.error()
+                        + "，退款错误: " + o.refundError());
+                broadcastLegacy(messagePrefix() + msg("announce-refund-failed", " §c发放奖励失败，且自动退款失败！请联系管理员手动补账。错误: {arg}", o.error()));
+            }
+            case SUCCESS -> {
+                recordCorrect(winner, rewardAmount);
+                // 异步转账期间玩家可能已退服：广播照发，背包/Title 类操作只对在线玩家做
+                boolean online = winner.isOnline();
+                String items = online ? giveItems(winner) : "";
+                broadcastLegacy(messagePrefix() + msg3("announce-win-reward", " §a玩家 §f{arg} §a答对了问题，获得 §e{arg2} §a货币！",
+                        null, winner.getName(), String.format(Locale.ROOT, "%,.2f", rewardAmount)) + items);
+                if (online) celebrate(winner, rewardAmount);
+            }
+        }
+    }
+
+    // 经济初始化转发到 EconomyBridge（渐进迁移：调用方不动，行为零变化）
     private boolean setupEconomy() {
-        try {
-            Class<?> econClass = Class.forName("net.milkbowl.vault.economy.Economy");
-            // get registration via ServicesManager.getRegistration(Class)
-            Object rsp = getServer().getServicesManager().getRegistration(econClass);
-            if (rsp == null) return false;
-            // RegisteredServiceProvider has method getProvider()
-            Method getProvider = rsp.getClass().getMethod("getProvider");
-            Object provider = getProvider.invoke(rsp);
-            this.econ = provider;
-            if (this.econ == null) return false;
-            this.economyClass = econClass;
-            this.economyMethods.clear();
-            this.economyProviderName = readEconomyName();
-            this.economyBankSupport = readEconomyBankSupport();
-            return true;
-        } catch (ClassNotFoundException cnf) {
-            getLogger().warning("Vault API 不在类路径中，无法加载 Economy 接口");
-            return false;
-        } catch (Throwable t) {
-            getLogger().log(Level.SEVERE, "加载经济提供者时出错", t);
-            return false;
-        }
+        return economy.setup();
     }
 
-    private String readEconomyName() {
-        try {
-            Object r = invokeEconomy("getName", new Class<?>[0]);
-            if (r instanceof String) {
-                String s = ((String) r).trim();
-                if (!s.isEmpty()) return s;
-            }
-        } catch (Throwable ignored) {}
-        return null;
+    private String economyProviderName() {
+        return economy.getProviderName();
     }
 
-    private boolean readEconomyBankSupport() {
-        try {
-            Object r = invokeEconomy("hasBankSupport", new Class<?>[0]);
-            if (r instanceof Boolean) return (Boolean) r;
-        } catch (Throwable ignored) {}
-        return true;
+    private boolean economyBankSupport() {
+        return economy.hasBankSupport();
     }
 
-    // Reflection helpers for interacting with economy provider without compile-time Vault dependency
+    // 经济调用转发到 EconomyBridge（渐进迁移：调用方不动，行为零变化）
     private double getBalanceOf(String who) {
-        if (econ == null) return 0.0;
-        if (payerIsServer && economyBankSupport) {
-            Double balance = extractBalance(invokeEconomy("bankBalance", new Class<?>[]{String.class}, who));
-            if (balance != null) return balance;
-        }
-        if (payerUsesUuid && payerOffline != null) {
-            try {
-                Object response = invokeEconomy("getBalance", new Class<?>[]{org.bukkit.OfflinePlayer.class}, payerOffline);
-                if (response instanceof Number) return ((Number) response).doubleValue();
-            } catch (Throwable t) {
-                getLogger().fine("CMI OfflinePlayer 余额查询失败，回退到账户名: " + t.getMessage());
-            }
-        }
-        try {
-            Object response = invokeEconomy("getBalance", new Class<?>[]{String.class}, who);
-            if (response instanceof Number) return ((Number) response).doubleValue();
-        } catch (Throwable t) {
-            getLogger().log(Level.WARNING, "查询账户 " + who + " 余额时出错", t);
-        }
-        if (payerOffline != null) {
-            Object response = invokeEconomy("getBalance", new Class<?>[]{org.bukkit.OfflinePlayer.class}, payerOffline);
-            if (response instanceof Number) return ((Number) response).doubleValue();
-        }
-        return 0.0;
+        return economy.getBalanceOf(who);
     }
 
     private Object withdrawFrom(String who, double amount) {
-        if (econ == null) return null;
-        if (payerIsServer && economyBankSupport) {
-            Object response = invokeEconomy("bankWithdraw", new Class<?>[]{String.class, double.class}, who, amount);
-            if (response != null) return response;
-        }
-        if (payerUsesUuid && payerOffline != null) {
-            try {
-                Object response = invokeEconomy("withdrawPlayer", new Class<?>[]{org.bukkit.OfflinePlayer.class, double.class}, payerOffline, amount);
-                if (response != null) return response;
-            } catch (Throwable t) {
-                getLogger().fine("CMI OfflinePlayer 扣款失败，回退到账户名: " + t.getMessage());
-            }
-        }
-        try {
-            Object response = invokeEconomy("withdrawPlayer", new Class<?>[]{String.class, double.class}, who, amount);
-            if (response != null) return response;
-        } catch (Throwable t) {
-            getLogger().log(Level.WARNING, "从账户 " + who + " 扣款时出错", t);
-        }
-        if (payerOffline != null) {
-            Object response = invokeEconomy("withdrawPlayer", new Class<?>[]{org.bukkit.OfflinePlayer.class, double.class}, payerOffline, amount);
-            if (response != null) return response;
-        }
-        return null;
+        return economy.withdrawFrom(who, amount);
     }
 
-    /** 给在线获奖者发奖：优先用 OfflinePlayer/UUID，避免改名玩家按旧名错发。 */
     private Object depositTo(Player winner, double amount) {
-        if (econ == null) return null;
-        // 在线玩家优先走 OfflinePlayer 通道（UUID 精确，防改名错发）
-        try {
-            Object response = invokeEconomy("depositPlayer", new Class<?>[]{org.bukkit.OfflinePlayer.class, double.class}, winner, amount);
-            if (response != null) return response;
-        } catch (Throwable ignored) {}
-        return depositTo(winner.getName(), amount);
+        return economy.depositTo(winner, amount);
+    }
+
+    private Object refundToPayer(double amount) {
+        return economy.refundToPayer(amount);
     }
 
     private Object depositTo(String who, double amount) {
-        if (econ == null) return null;
-        try {
-            if (payerIsServer && economyBankSupport && who.equals(payerDisplay)) {
-                Object bankResponse = invokeEconomy("bankDeposit", new Class<?>[]{String.class, double.class}, who, amount);
-                if (bankResponse != null) return bankResponse;
-            }
-            if (payerUsesUuid && who != null && payerOffline != null && payerOffline.getName() != null && payerOffline.getName().equals(who)) {
-                // deposit to offline payer
-                try {
-                    Object response = invokeEconomy("depositPlayer", new Class<?>[]{org.bukkit.OfflinePlayer.class, double.class}, payerOffline, amount);
-                    if (response != null) return response;
-                } catch (Throwable ignored) {}
-            }
-            try {
-                Object response = invokeEconomy("depositPlayer", new Class<?>[]{String.class, double.class}, who, amount);
-                if (response != null) return response;
-            } catch (Throwable ignored) {}
-        } catch (Throwable t) {
-            getLogger().log(Level.WARNING, "给账户充值时出错", t);
-        }
-        return null;
-    }
-
-    private Object invokeEconomy(String methodName, Class<?>[] parameterTypes, Object... arguments) {
-        if (econ == null || economyClass == null) return null;
-        try {
-            String cacheKey = methodName + Arrays.toString(parameterTypes);
-            Method m = economyMethods.get(cacheKey);
-            if (m == null && !economyMethods.containsKey(cacheKey)) {
-                try {
-                    m = economyClass.getMethod(methodName, parameterTypes);
-                } catch (NoSuchMethodException ignored) {
-                    m = null;
-                }
-                economyMethods.put(cacheKey, m); // null 也缓存：缺失的方法下次直接返回
-            }
-            if (m == null) return null;
-            return m.invoke(econ, arguments);
-        } catch (Throwable t) {
-            getLogger().log(Level.WARNING, "调用经济方法 " + methodName + " 时出错", t);
-            return null;
-        }
-    }
-
-    private Double extractBalance(Object response) {
-        if (response instanceof Number) return ((Number) response).doubleValue();
-        if (response == null) return null;
-        try {
-            try {
-                Method method = response.getClass().getMethod("getBalance");
-                Object value = method.invoke(response);
-                if (value instanceof Number) return ((Number) value).doubleValue();
-            } catch (NoSuchMethodException ignored) {
-                java.lang.reflect.Field field = response.getClass().getField("balance");
-                Object value = field.get(response);
-                if (value instanceof Number) return ((Number) value).doubleValue();
-            }
-        } catch (Throwable t) {
-            getLogger().log(Level.WARNING, "读取经济余额响应时出错", t);
-        }
-        return null;
+        return economy.depositTo(who, amount);
     }
 
     private boolean isEconomyResponseSuccess(Object resp) {
-        if (resp == null) return false;
-        try {
-            // try transactionSuccess() method
-            try {
-                Method m = resp.getClass().getMethod("transactionSuccess");
-                Object r = m.invoke(resp);
-                if (r instanceof Boolean) return (Boolean) r;
-            } catch (NoSuchMethodException ignored) {}
-            // try success field
-            try {
-                java.lang.reflect.Field f = resp.getClass().getField("success");
-                Object r = f.get(resp);
-                if (r instanceof Boolean) return (Boolean) r;
-            } catch (NoSuchFieldException ignored) {}
-        } catch (Throwable t) {
-            getLogger().log(Level.WARNING, "检查经济响应时出错", t);
-        }
-        return false;
+        return economy.isSuccess(resp);
     }
 
     private String getEconomyResponseError(Object resp) {
-        if (resp == null) return "null_response";
-        try {
-            // try errorMessage field
-            try {
-                java.lang.reflect.Field f = resp.getClass().getField("errorMessage");
-                Object r = f.get(resp);
-                if (r != null) return r.toString();
-            } catch (NoSuchFieldException ignored) {}
-            // try getErrorMessage() method
-            try {
-                Method m = resp.getClass().getMethod("getErrorMessage");
-                Object r = m.invoke(resp);
-                if (r != null) return r.toString();
-            } catch (NoSuchMethodException ignored) {}
-            // try toString()
-            return resp.toString();
-        } catch (Throwable t) {
-            getLogger().log(Level.WARNING, "读取经济响应错误信息时出错", t);
-            return "error_read_failed";
+        return economy.errorOf(resp);
+    }
+
+    // 命令处理器：子命令注册表驱动——别名、权限、处理器、补全全部单源定义，
+    // 新增子命令只需在 COMMANDS 加一行 + sendHelp 补一行 + plugin.yml/README 同步
+    private interface SubHandler {
+        boolean handle(CommandSender sender, String label, String[] args);
+    }
+
+    private static class SubCommand {
+        final String name;
+        final boolean admin;
+        final List<String> aliases;
+        final SubHandler handler;
+        // 帮助行：msg 键与默认值（help 菜单循环生成，新增子命令不再漏行）
+        final String helpKey;
+        final String helpDef;
+
+        SubCommand(String name, boolean admin, SubHandler handler, String helpKey, String helpDef, String... aliases) {
+            this.name = name;
+            this.admin = admin;
+            this.handler = handler;
+            this.helpKey = helpKey;
+            this.helpDef = helpDef;
+            this.aliases = Arrays.asList(aliases);
+        }
+
+        boolean matches(String sub) {
+            if (name.equals(sub)) return true;
+            for (String a : aliases) {
+                if (a.equals(sub)) return true;
+            }
+            return false;
         }
     }
 
-    // Command handler
     private class QuizCommand implements CommandExecutor, TabCompleter {
+        private final List<SubCommand> commands = Arrays.asList(
+                new SubCommand("help", false, (s, l, a) -> { sendHelp(s, l); return true; },
+                        "help-help", "&e/{cmd} help &7- 显示此帮助", "?"),
+                new SubCommand("top", false, (s, l, a) -> { sendTop(s, a.length > 1 ? a[1] : null); return true; },
+                        "help-top", "&e/{cmd} top [数量] &7- 答题排行榜（默认 10，最多 20）"),
+                new SubCommand("stats", false, (s, l, a) -> { sendStats(s, a.length > 1 ? a[1] : null); return true; },
+                        "help-stats", "&e/{cmd} stats [玩家] &7- 查看答题统计（默认自己）"),
+                new SubCommand("status", false, (s, l, a) -> { sendStatus(s); return true; },
+                        "help-status", "&e/{cmd} status &7- 查看插件状态"),
+                new SubCommand("start", true, (s, l, a) -> handleStart(s),
+                        "help-start", "&e/{cmd} start &7- 启动定时出题"),
+                new SubCommand("stop", true, (s, l, a) -> handleStop(s),
+                        "help-stop", "&e/{cmd} stop &7- 停止定时出题"),
+                new SubCommand("question", true, (s, l, a) -> handleQuestion(s, a),
+                        "help-question", "&e/{cmd} question [force] &7- 发布新题目（force 强制）", "q"),
+                new SubCommand("reload", true, (s, l, a) -> handleReload(s),
+                        "help-reload", "&e/{cmd} reload &7- 重载配置")
+        );
+
+        private SubCommand find(String sub) {
+            for (SubCommand c : commands) {
+                if (c.matches(sub)) return c;
+            }
+            return null;
+        }
+
         @Override
         public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
             if (args.length == 0) {
-                sendHelp(sender);
+                sendHelp(sender, label);
                 return true;
             }
             String sub = args[0].toLowerCase(Locale.ROOT);
-            // 查询类子命令全员可用
-            switch (sub) {
-                case "help":
-                case "?":
-                    sendHelp(sender);
-                    return true;
-                case "top":
-                    sendTop(sender, args.length > 1 ? args[1] : null);
-                    return true;
-                case "stats":
-                    sendStats(sender, args.length > 1 ? args[1] : null);
-                    return true;
-                case "status":
-                    sendStatus(sender);
-                    return true;
-            }
-            boolean adminCmd = sub.equals("start") || sub.equals("stop") || sub.equals("question")
-                    || sub.equals("q") || sub.equals("reload");
-            if (!adminCmd) {
-                sender.sendMessage("§c未知子命令: " + sub);
-                sendHelp(sender);
+            SubCommand cmd = find(sub);
+            if (cmd == null) {
+                sender.sendMessage(msg("unknown-command", "&c未知子命令: {arg}", sub));
+                sendHelp(sender, label);
                 return true;
             }
-            if (!sender.hasPermission("letmeask.admin")) {
-                sender.sendMessage("§c你没有权限执行此命令 (letmeask.admin)");
+            if (cmd.admin && !sender.hasPermission("letmeask.admin")) {
+                sender.sendMessage(msg("no-permission", "&c你没有权限执行此命令 (letmeask.admin)", null));
                 return true;
             }
-            switch (sub) {
-                case "start":
-                    startTask();
-                    if (currentQuestion == null && !verifying && !paused) {
-                        publishQuestion();
-                        nextPostAtMillis = System.currentTimeMillis() + questionIntervalSeconds * 1000L;
-                    }
-                    sender.sendMessage("§a已启动定时出题");
-                    return true;
-                case "stop":
-                    stopTask();
-                    sender.sendMessage("§c已停止定时出题");
-                    return true;
-                case "question":
-                case "q": {
-                    boolean force = args.length > 1 && args[1].equalsIgnoreCase("force");
-                    boolean ok = postNewQuestion(force);
-                    if (ok) sender.sendMessage("§a已发布新题目");
-                    else sender.sendMessage("§c无法发布新题目（已有题目/正在验证/已暂停）。使用 /letmeask question force 可强制发布");
-                    return true;
-                }
-                case "reload": {
-                    boolean ok = loadConfigValues();
-                    // 重载时若正在验证：解锁并作废本轮，否则锁会一直占到验证超时
-                    if (verifying) {
-                        if (verifyingPlayer != null) resetStreak(verifyingPlayer);
-                        clearQuestionState();
-                        sender.sendMessage("§e重载时存在未完成的验证，已作废本轮题目");
-                    }
-                    // restart scheduler to pick up interval changes
-                    startTask();
-                    if (ok) sender.sendMessage("§a已重载配置(base.yml 与 questions.yml)");
-                    else sender.sendMessage("§e配置已重载，但新题库为空，已保留旧题库继续运行");
-                    return true;
-                }
-            }
-            return true; // unreachable：adminCmd 已前置过滤，但保留以满足编译
+            return cmd.handler.handle(sender, label, args);
         }
 
-        private void sendHelp(CommandSender sender) {
-            sender.sendMessage("§6§m----------§r §6LetMeAsk 帮助 §6§m----------");
-            sender.sendMessage("§e/letmeask help §7- 显示此帮助");
-            sender.sendMessage("§e/letmeask top [数量] §7- 答题排行榜（默认 10，最多 20）");
-            sender.sendMessage("§e/letmeask stats [玩家] §7- 查看答题统计（默认自己）");
-            sender.sendMessage("§e/letmeask status §7- 查看插件状态");
-            if (sender.hasPermission("letmeask.admin")) {
-                sender.sendMessage("§6管理命令:");
-                sender.sendMessage("§e/letmeask start §7- 启动定时出题");
-                sender.sendMessage("§e/letmeask stop §7- 停止定时出题");
-                sender.sendMessage("§e/letmeask question [force] §7- 发布新题目（force 强制）");
-                sender.sendMessage("§e/letmeask reload §7- 重载配置");
+        private boolean handleStart(CommandSender sender) {
+            startTask();
+            if (currentQuestion == null && !verifying && !paused) {
+                publishQuestion();
+                nextPostAtMillis = System.currentTimeMillis() + questionIntervalSeconds * 1000L;
             }
-            sender.sendMessage("§6§m--------------------------------");
+            sender.sendMessage(msg("started", "&a已启动定时出题", null));
+            return true;
+        }
+
+        private boolean handleStop(CommandSender sender) {
+            stopTask();
+            // 停止同时作废当前题并解锁验证：否则题目残留仍可作答，与“已停止”语义矛盾
+            if (currentQuestion != null || verifying) {
+                if (verifyingPlayer != null) resetStreak(verifyingPlayer);
+                clearQuestionState();
+                sender.sendMessage(msg("stopped-with-question", "&c已停止定时出题（当前题目已作废）", null));
+            } else {
+                sender.sendMessage(msg("stopped", "&c已停止定时出题", null));
+            }
+            return true;
+        }
+
+        private boolean handleQuestion(CommandSender sender, String[] args) {
+            boolean force = args.length > 1 && args[1].equalsIgnoreCase("force");
+            boolean ok = postNewQuestion(force);
+            if (ok) sender.sendMessage(msg("question-posted", "&a已发布新题目", null));
+            else sender.sendMessage(msg("question-blocked", "&c无法发布新题目（已有题目/正在验证/已暂停）。使用 /letmeask question force 可强制发布", null));
+            return true;
+        }
+
+        private boolean handleReload(CommandSender sender) {
+            boolean ok = loadConfigValues();
+            // 配置重载成功：缺失告警标记重置（可能刚装上 HumanVerify），失败回滚则保留
+            if (ok) humanVerify.resetMissingWarning();
+            // 重载时若正在验证：解锁并作废本轮，否则锁会一直占到验证超时
+            if (verifying) {
+                if (verifyingPlayer != null) resetStreak(verifyingPlayer);
+                clearQuestionState();
+                sender.sendMessage(msg("reload-dropped-verify", "&e重载时存在未完成的验证，已作废本轮题目", null));
+            }
+            // restart scheduler to pick up interval changes
+            startTask();
+            startLeaderboardTask(); // 排行榜广播配置也可能变了，一并重启
+            if (ok) sender.sendMessage(msg("reloaded", "&a已重载配置(base.yml 与 questions.yml)", null));
+                    else sender.sendMessage(msg("reloaded-empty", "&e配置已重载，但新题库为空，已保留旧题库与旧配置继续运行", null));
+            return true;
+        }
+
+        private void sendHelp(CommandSender sender, String label) {
+            // 用玩家实际输入的别名展示（如 /lma 进来就显示 /lma），复制即用；
+            // 白名单校验：label 来自命令注册，正常只有 letmeask/lma，异常值回退默认
+            // （防其他插件伪造命令转发时注入换行/颜色码破坏聊天格式）
+            String cmd = ("lma".equalsIgnoreCase(label)) ? "lma" : "letmeask";
+            sender.sendMessage(msg("help-header", "&6&m----------&r &6LetMeAsk 帮助 &6&m----------", null));
+            // 帮助行从注册表循环生成：新增子命令只需在 commands 加一行，不会再漏
+            boolean adminSection = false;
+            for (SubCommand c : commands) {
+                if (c.admin && !sender.hasPermission("letmeask.admin")) continue;
+                if (c.admin && !adminSection) {
+                    sender.sendMessage(msg("help-admin-header", "&6管理命令:", null));
+                    adminSection = true;
+                }
+                sender.sendMessage(msg2(c.helpKey, c.helpDef, cmd, null));
+            }
+            sender.sendMessage(msg("help-footer", "&6&m--------------------------------", null));
         }
 
         private void sendStatus(CommandSender sender) {
-            sender.sendMessage("§6LetMeAsk 状态:");
-            sender.sendMessage(" 自动出题: " + (tickerTask != null ? "§a运行中" : "§c已停止"));
-            sender.sendMessage(" 题库数量: §f" + questions.size());
-            sender.sendMessage(" 当前题目: " + (currentQuestion != null ? currentQuestion.question : "无"));
-            sender.sendMessage(" 暂停(余额不足): " + (paused ? "§c是" : "§a否"));
-            sender.sendMessage(" 人机验证锁定: " + (verifying ? "§c是" : "§a否"));
-            sender.sendMessage(" 累计出题: §f" + totalAsked + " §7已答对: §f" + totalAnswered);
+            sender.sendMessage(msg("status-header", "&6LetMeAsk 状态:", null));
+            // 是/否/运行中走可配置，便于英文模式切换（common-yes/no/running）
+            String yes = msg("common-yes", "§c是", null);
+            String no = msg("common-no", "§a否", null);
+            sender.sendMessage(msg("status-task", " 自动出题: {arg}",
+                    tickerTask != null ? msg("common-running", "§a运行中", null) : msg("common-stopped", "§c已停止", null)));
+            sender.sendMessage(msg("status-questions", " 题库数量: §f{arg}", String.valueOf(questions.size())));
+            sender.sendMessage(msg("status-current", " 当前题目: {arg}",
+                    currentQuestion != null ? currentQuestion.question : msg("common-none", "无", null)));
+            sender.sendMessage(msg("status-paused", " 暂停(余额不足): {arg}", paused ? yes : no));
+            sender.sendMessage(msg("status-verifying", " 人机验证锁定: {arg}", verifying ? yes : no));
+            sender.sendMessage(msg3("status-total", " 累计出题: §f{arg} §7已答对: §f{arg2}",
+                    null, String.valueOf(stats.getTotalAsked()), String.valueOf(stats.getTotalAnswered())));
             if (economyAvailable) {
-                sender.sendMessage(" 支付玩家: §f" + payerDisplay + " §7(余额: " + String.format("%.2f", getBalanceOf(payerDisplay)) + ")");
-                sender.sendMessage(" 经济后端: §f" + (economyProviderName != null ? economyProviderName : "未知")
-                        + (payerIsServer && !economyBankSupport ? " §7(无银行账户，按账户名扣款)" : ""));
+                // 出资人账户名与余额属于运维信息，仅管理员可见（status 默认全员可执行）
+                if (!sender.hasPermission("letmeask.admin")) {
+                    sender.sendMessage(" 经济系统: §a已启用");
+                    return;
+                }
+                // 余额查询可能打 Vault 后端 IO，异步查完再回主线程输出，避免卡主线程
+                final String payerNameSnap = payerDisplay();
+                final String providerSnap = economyProviderName();
+                final boolean bankWarn = payerIsServer() && !economyBankSupport();
+                Bukkit.getScheduler().runTaskAsynchronously(QuizPlugin.this, () -> {
+                    double bal;
+                    try {
+                        bal = getBalanceOf(payerNameSnap);
+                    } catch (Throwable t) {
+                        bal = Double.NaN;
+                    }
+                    final double balance = bal;
+                    Bukkit.getScheduler().runTask(QuizPlugin.this, () -> {
+                        if (sender instanceof Player && !((Player) sender).isOnline()) return;
+                        String balText = Double.isNaN(balance)
+                                ? "§c查询失败"
+                                : String.format(Locale.ROOT, "%,.2f", balance);
+                        sender.sendMessage(" 支付玩家: §f" + payerNameSnap + " §7(余额: " + balText + ")");
+                        sender.sendMessage(" 经济后端: §f" + (providerSnap != null ? providerSnap : "未知")
+                                + (bankWarn ? " §7(无银行账户，按账户名扣款)" : ""));
+                    });
+                });
             } else {
                 sender.sendMessage(" 经济系统: §e未检测到 Vault（纯公告模式，无货币奖励）");
             }
@@ -1321,8 +1584,13 @@ public class QuizPlugin extends JavaPlugin implements Listener {
             if (name == null || name.isEmpty()) {
                 return (sender instanceof Player) ? (Player) sender : null;
             }
-            // 先走缓存（在线/近期离线玩家命中，不碰磁盘）；未命中再走 getOfflinePlayer
-            OfflinePlayer off = Bukkit.getOfflinePlayerIfCached(name);
+            // 先走 Paper 缓存；Spigot 没有该方法时降级到通用 getOfflinePlayer
+            OfflinePlayer off;
+            try {
+                off = Bukkit.getOfflinePlayerIfCached(name);
+            } catch (LinkageError ignored) {
+                off = null;
+            }
             if (off == null) off = Bukkit.getOfflinePlayer(name);
             // getOfflinePlayer(name) 对从未进服的名字也会返回占位对象，用是否玩过来过滤
             if (!off.hasPlayedBefore() && !off.isOnline()) return null;
@@ -1336,13 +1604,21 @@ public class QuizPlugin extends JavaPlugin implements Listener {
                 else sender.sendMessage(msg("player-not-found", "&c找不到玩家: {arg}", nameArg));
                 return;
             }
+            // 查自己始终允许；查他人需要 letmeask.stats.others（默认 true，可由权限插件收紧）
+            if (sender instanceof Player
+                    && !((Player) sender).getUniqueId().equals(target.getUniqueId())
+                    && !sender.hasPermission("letmeask.stats.others")) {
+                sender.sendMessage(msg("stats-no-permission",
+                        "&c你没有权限查看其他玩家的统计 (letmeask.stats.others)", null));
+                return;
+            }
             String key = target.getUniqueId().toString();
             cacheName(key, target.getName()); // 顺手更新缓存（加锁，与异步保存互斥）
             String display = displayNameOf(key);
-            int correct = totalCorrect.getOrDefault(key, 0);
-            double earned = totalEarned.getOrDefault(key, 0.0);
+            int correct = stats.getCorrect(key);
+            double earned = stats.getEarned(key);
             sender.sendMessage("§6玩家 §f" + display + " §6的答题统计:");
-            sender.sendMessage(" 答对: §f" + correct + " §7累计奖金: §e" + String.format("%.2f", earned));
+            sender.sendMessage(" 答对: §f" + correct + " §7累计奖金: §e" + String.format(Locale.ROOT, "%,.2f", earned));
         }
 
         private void sendTop(CommandSender sender, String countArg) {
@@ -1360,10 +1636,15 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         @Override
         public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
             if (args.length == 1) {
+                // 补全与分发同源：注册表即唯一来源，新增子命令自动出现在补全里
                 String prefix = args[0].toLowerCase(Locale.ROOT);
-                List<String> subs = new ArrayList<>(Arrays.asList("help", "top", "stats", "status"));
-                if (sender.hasPermission("letmeask.admin")) {
-                    subs.addAll(Arrays.asList("start", "stop", "question", "q", "reload"));
+                boolean admin = sender.hasPermission("letmeask.admin");
+                List<String> subs = new ArrayList<>();
+                for (SubCommand c : commands) {
+                    if (!c.admin || admin) {
+                        subs.add(c.name);
+                        subs.addAll(c.aliases);
+                    }
                 }
                 return subs.stream()
                         .filter(subcommand -> subcommand.startsWith(prefix))
@@ -1375,11 +1656,24 @@ public class QuizPlugin extends JavaPlugin implements Listener {
                 return "force".startsWith(prefix) ? Collections.singletonList("force") : Collections.emptyList();
             }
 
+            if (args.length == 2 && args[0].equalsIgnoreCase("stats")) {
+                // 补全同样按权限过滤，避免向无权者枚举在线玩家名
+                if (!sender.hasPermission("letmeask.stats.others")) return Collections.emptyList();
+                String prefix = args[1].toLowerCase(Locale.ROOT);
+                List<String> names = new ArrayList<>();
+                for (Player p : Bukkit.getOnlinePlayers()) {
+                    if (p.getName() != null && p.getName().toLowerCase(Locale.ROOT).startsWith(prefix)) {
+                        names.add(p.getName());
+                    }
+                }
+                return names;
+            }
+
             return Collections.emptyList();
         }
     }
 
-    // Simple question holder (supports multiple accepted answers + weight)
+    // 题目数据（支持多答案与权重）
     private static class Question {
         final String question;
         final List<String> answers; // 任一匹配即算答对（原始文本，用于公布答案）
@@ -1388,17 +1682,13 @@ public class QuizPlugin extends JavaPlugin implements Listener {
         volatile long postTime;
         volatile java.util.UUID id;
 
-        Question(String q, List<String> as) {
-            this(q, as, 1);
-        }
-
         Question(String q, List<String> as, int w) {
             this.question = q;
             this.answers = Collections.unmodifiableList(new ArrayList<>(as));
             List<String> norm = new ArrayList<>(as.size());
             for (String a : as) norm.add(normalize(a));
             this.normalizedAnswers = Collections.unmodifiableList(norm);
-            this.weight = Math.max(1, w);
+            this.weight = clampWeight(w);
         }
 
         /** 公布答案时展示的首选答案。 */

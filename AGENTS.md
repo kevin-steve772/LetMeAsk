@@ -4,18 +4,18 @@ Minecraft Paper/Spigot 抢答插件（答题发金币）。用户可见文案与
 
 ## 构建与验证
 
-- **唯一可用的构建命令：`mvn clean package`** → `target/LetMeAsk-1.1.0.jar`。需要联网（paper-api 为 papermc 仓库的 SNAPSHOT）。
-- **不要用 `gradle build`**：系统 Gradle 是 4.4.1，而 `build.gradle` 用了 toolchain（需 6.7+），脚本求值阶段即失败；仓库也没有 `gradlew` wrapper。`build.gradle`、`settings.gradle`、`libs/`、`sources.txt` 是另一套构建的遗留物，`libs/*.jar` 是本地 paper-api 副本（pom 用不到，别改 pom 去配合它）。
-- 没有测试、没有 lint/format 配置。**编译通过就是全部本地验证手段。**
-- 版本号单一来源是 `pom.xml` 的 `<revision>`：`plugin.yml` 写 `${revision}` 由 Maven 资源过滤代入，`build.gradle` 用 `XmlParser` 读 pom，所以只改 pom（README 里手写的 jar 文件名例外）。注意 CI 会另加 `-<sha>` 短哈希后缀。
+- **唯一可用的构建命令：`mvn clean package`** → `target/LetMeAsk-<revision>.jar`（当前 revision 见 `pom.xml`）。需要联网（paper-api 为 papermc 仓库的 SNAPSHOT）。
+- **唯一构建入口是 Maven**：`mvn clean package`。遗留的 Gradle 脚本、`libs/` 本地 jar 与 `sources.txt` 已移除，不要再引入第二套构建。
+- 有少量 JUnit 单测（`src/test/java`，`mvn package` 会自动执行）；没有 lint/format 配置，**编译与单测通过是全部本地验证手段**。
+- 版本号单一来源是 `pom.xml` 的 `<revision>`：`plugin.yml` 写 `${revision}` 由 Maven 资源过滤代入，所以只改 pom（README 里手写的 jar 文件名例外）。注意 CI 会另加 `-<sha>` 短哈希后缀。
 - **推 `main` 会触发 `.github/workflows/build-release.yml`**：push 即 CI 构建并覆盖发布到 `latest` 这个滚动 release（预发布）。推之前先本地 `mvn clean package` 过一遍。
 - `.github/modernize/` 只是两个 hook 脚本，不是 CI。
 - `pom.xml` 目标 release 17；本机 JDK 25，可直接编译。
 
 ## 代码结构
 
-- 实际只有一个源文件：`src/main/java/com/cubex/quiz/QuizPlugin.java`（约 1400 行，含内部类 `Question`、`QuizCommand`、`ChatHistory`）。命令、配置、经济、防作弊全在这里，不存在其他包可去。
-- `plugin.yml` 与代码必须同步：子命令集中在 `QuizCommand.onCommand` 的 switch，帮助文案在 `usage:`，补全列表在 `onTabComplete`。新增子命令要同时改这三处 + README 命令表。
+- 源文件（`src/main/java/com/cubex/quiz/`）：`QuizPlugin.java`（状态机与流程编排，含内部类 `Question`、`QuizCommand`、`ChatHistory`）+ 拆出的 `EconomyBridge.java`（经济反射/出资人/退款通道）、`QuestionMatcher.java`（归一化/模糊匹配）、`Messages.java`（前缀缓存/msg 可配置消息）、`StatsStore.java`（统计读写/落盘/排行快照，锁内部自持）、`HumanVerifyBridge.java`（验证反射/降级/一次性告警/结果判定）、`ItemRewards.java`（物品奖励解析/构建/发放，背包满掉地上）。主类通过同名 private 转发方法调用子系统，行为零变化。
+- `plugin.yml` 与代码必须同步：子命令在 `QuizCommand.commands` 注册表单源定义（别名/权限/处理器），`sendHelp` 文案、`onTabComplete` 补全都从同一张表生成。新增子命令要在注册表加一行 + `sendHelp` 补一行 + `plugin.yml`/`README` 命令表同步。
 
 ## 可选依赖走反射，别加进 pom
 
