@@ -7,29 +7,55 @@
 # reward: 每题奖励金额
 # question-interval-seconds: 自动出题间隔（秒）
 # anti-bot-threshold-seconds: 回答速度（秒）小于等于该值会触发人机验证
-# anti-bot-chat-history-count: 答对时检查最近多少条聊天消息（至少 2 条）
-# anti-bot-chat-min-interval-seconds: 最近消息中任一相邻间隔低于该秒数则踢出；0=禁用
+# anti-bot-chat-history-count: 答对时检查最近多少条聊天消息（范围 3~20，窗口填满后才判定）
+# anti-bot-chat-min-interval-seconds: 最近完整窗口中所有相邻间隔都低于该秒数才踢出；0=禁用
 # fuzzy-similarity-threshold: 0-1，答案相似度阈值，越高越严格
 # question-timeout-seconds: 答题超时时间（秒），超时后公布答案并出下一题；设置为 0 禁用
 
 payer: Server
 reward: 50.0
+# 语言：zh=中文（默认），en=英文（读下方 messages-en 段，可自行覆盖）
+language: zh
 # 自动出题间隔（秒），最小 5 秒
 question-interval-seconds: 60
 question-timeout-seconds: 30
 # 回答用时（秒，支持小数）小于等于该值会触发人机验证
 anti-bot-threshold-seconds: 1
-# 答对时检查本轮题目期间最近 3 条消息的间隔；低于 0.5 秒踢出
+# 答对时检查本轮题目期间最近 3 条消息（窗口未填满不触发；全部相邻间隔都低于 0.5 秒才踢出）
 anti-bot-chat-history-count: 3
 anti-bot-chat-min-interval-seconds: 0.5
+# 人机验证服务不可用（未安装 HumanVerify）时的策略：
+#   deny  = 拒绝发奖并作废本轮（默认，防止脚本绕过验证刷奖励）
+#   award = 降级为直接发奖（旧行为；装有脚本风险的奖励服请勿使用）
+anti-bot-verify-unavailable: deny
+# 答错反馈：只提示本人，冷却秒内不重复提示；enabled 设 false 关闭
+wrong-feedback:
+  enabled: true
+  cooldown-seconds: 5
 # 同一玩家连续答对达到此次数时触发人机验证；设置为 0 可禁用此条件
 anti-bot-correct-answer-threshold: 3
 # 连击统计时间窗口（秒）：超过该时间未答对则连击清零；0=不清零
 anti-bot-streak-window-seconds: 300
 # 人机验证超时（秒）：回调长时间未返回时自动解锁并作废本轮，最小 10 秒
 verify-timeout-seconds: 120
+# 出题因资金不足暂停后，每隔多少秒复查一次出资人余额；最小 5 秒
+balance-retry-seconds: 30
 # 0-1，答案相似度阈值，越高越严格；1.0 = 严格精确匹配
 fuzzy-similarity-threshold: 0.75
+# 定时广播排行榜：enabled 设为 false 关闭；minutes 最小 1 分钟；count 最多 20 条
+leaderboard-broadcast:
+  enabled: true
+  minutes: 60
+  count: 10
+
+# 物品奖励：与金币叠加发放，背包满掉在脚下
+# random-one: true=每次随机其一，false=全发；name/lore/enchantments 可选
+items:
+  enabled: false
+  random-one: false
+  list:
+    - {material: DIAMOND, amount: 2}
+    - {material: GOLD_INGOT, amount: 1, name: "&6幸运金锭", lore: ["&7答题奖励"], enchantments: {luck: 1}}
 
 # 答对庆祝特效：只给答对者发 Title，音效全服可听
 # sound 为 Bukkit Sound 枚举名，设为 none 可关闭音效
@@ -41,11 +67,144 @@ celebrate:
   volume: 1.0
   pitch: 1.0
 
+# 出题/答题广播的展示通道：
+#   chat      = 聊天栏（默认，与原行为完全一致）
+#   actionbar = 动作栏（题目存活期间每秒重发，不会被 2~3 秒后消失吞掉）
+#   title     = 标题（消息作为大标题，副标题留空）
+#   both      = 聊天栏 + 动作栏
+# 动作栏与标题由数据包层直接发给客户端，不经过聊天管线，聊天类插件（PlayerChat 等）拦不到。
+# 如果主服出现「OP 能看到题目、普通玩家看不到」，把这里改成 actionbar 或 both 即可。
+broadcast-mode: chat
+
 # 消息前缀，支持 Bukkit 颜色代码（例如 &b[答题]）
 # 查询类提示消息也可在下方自定义（支持 & 颜色码，{arg} 为参数占位）
 messages:
   prefix: "&6[教育部]"
+  # 通用词（状态页是/否/运行中/无，供中英文切换）
+  common-yes: "§c是"
+  common-no: "§a否"
+  common-running: "§a运行中"
+  common-stopped: "§c已停止"
+  common-none: "无"
   console-need-name: "&c控制台请指定玩家名：/letmeask stats <玩家名>"
   player-not-found: "&c找不到玩家: {arg}"
+  stats-no-permission: "&c你没有权限查看其他玩家的统计 (letmeask.stats.others)"
   invalid-count: "&c数量参数无效，使用默认值 10"
   no-records: "&e暂无答题记录"
+  # 以下为管理命令反馈与踢人原因（支持 & 颜色码，{arg} 为参数占位）
+  unknown-command: "&c未知子命令: {arg}"
+  no-permission: "&c你没有权限执行此命令 (letmeask.admin)"
+  started: "&a已启动定时出题"
+  stopped: "&c已停止定时出题"
+  stopped-with-question: "&c已停止定时出题（当前题目已作废）"
+  question-posted: "&a已发布新题目"
+  question-blocked: "&c无法发布新题目（已有题目/正在验证/已暂停）。使用 /letmeask question force 可强制发布"
+  reload-dropped-verify: "&e重载时存在未完成的验证，已作废本轮题目"
+  reloaded: "&a已重载配置(base.yml 与 questions.yml)"
+  reloaded-empty: "&e配置已重载，但新题库为空，已保留旧题库与旧配置继续运行"
+  kick-verify-timeout: "人机验证超时"
+  kick-chat-too-fast: "聊天消息间隔过短"
+  kick-verify-failed: "未通过人机验证"
+  # 以下为游戏流程广播（支持 & 颜色码，{arg}/{arg2} 为参数占位）
+  announce-question: " §f新题目: §f{arg}"
+  announce-funded: " §a资金已足额，恢复出题。当前余额: {arg}，预计还可以奖励{arg2}次。"
+  announce-verify-timeout-kick: " §c玩家 {arg} 因人机验证超时被踢出服务器，本轮题目作废。"
+  announce-verify-timeout: " §c人机验证超时，本轮题目作废。"
+  announce-timeout: " §c无人答对！答案是: §f{arg}"
+  announce-wrong: " §c回答错误，再想想！"
+  announce-chat-kick: " §c玩家 §f{arg} §c因聊天消息间隔过短被踢出服务器。"
+  announce-verify-start: " §c玩家 §f{arg} §c{arg2}，需要进行人机验证..."
+  announce-verify-unavailable: " §c人机验证服务不可用，本轮答案不予发奖。"
+  announce-verify-failed: " §c玩家 §f{arg} §c未通过人机验证，已被踢出服务器。"
+  announce-win-no-vault: " §a玩家 §f{arg} §a答对了问题！§7（未安装 Vault，本轮无货币奖励）"
+  announce-win: " §a玩家 §f{arg} §a答对了问题！"
+  announce-win-self: " §a玩家 §f{arg} §a答对了问题！§7（出资人自答，无需转账）"
+  announce-win-reward: " §a玩家 §f{arg} §a答对了问题，获得 §e{arg2} §a货币！"
+  announce-win-items: "，另获 {arg}"
+  announce-paused-funds: " §c出题已暂停：资金不足（需要 {arg}，当前 {arg2}）。"
+  announce-transfer-failed: " §c转账失败（错误: {arg}），出题已暂停。请检查服务器日志。"
+  announce-refunded: " §c发放奖励失败，已退款，请联系管理员。错误: {arg}"
+  announce-refund-failed: " §c发放奖励失败，且自动退款失败！请联系管理员手动补账。错误: {arg}"
+  # 以下为帮助菜单与状态页（{cmd} 为命令别名如 lma/{arg} 为参数占位）
+  help-header: "&6&m----------&r &6LetMeAsk 帮助 &6&m----------"
+  help-help: "&e/{cmd} help &7- 显示此帮助"
+  help-top: "&e/{cmd} top [数量] &7- 答题排行榜（默认 10，最多 20）"
+  help-stats: "&e/{cmd} stats [玩家] &7- 查看答题统计（默认自己）"
+  help-status: "&e/{cmd} status &7- 查看插件状态"
+  help-admin-header: "&6管理命令:"
+  help-start: "&e/{cmd} start &7- 启动定时出题"
+  help-stop: "&e/{cmd} stop &7- 停止定时出题"
+  help-question: "&e/{cmd} question [force] &7- 发布新题目（force 强制）"
+  help-reload: "&e/{cmd} reload &7- 重载配置"
+  help-footer: "&6&m--------------------------------"
+  status-header: "&6LetMeAsk 状态:"
+  status-task: " 自动出题: {arg}"
+  status-questions: " 题库数量: &f{arg}"
+  status-current: " 当前题目: {arg}"
+  status-paused: " 暂停(余额不足): {arg}"
+  status-verifying: " 人机验证锁定: {arg}"
+  status-total: " 累计出题: §f{arg} §7已答对: §f{arg2}"
+
+# English messages (used when language: en; missing keys fall back to messages above)
+messages-en:
+  prefix: "&6[Quiz]"
+  common-yes: "§cYes"
+  common-no: "§aNo"
+  common-running: "§aRunning"
+  common-stopped: "§cStopped"
+  common-none: "None"
+  console-need-name: "&cConsole must specify a player: /letmeask stats <player>"
+  player-not-found: "&cPlayer not found: {arg}"
+  stats-no-permission: "&cYou lack permission to view other players' stats (letmeask.stats.others)"
+  invalid-count: "&cInvalid count, using default 10"
+  no-records: "&eNo records yet"
+  unknown-command: "&cUnknown subcommand: {arg}"
+  no-permission: "&cYou lack permission (letmeask.admin)"
+  started: "&aQuiz scheduler started"
+  stopped: "&cQuiz scheduler stopped"
+  stopped-with-question: "&cQuiz scheduler stopped (current question voided)"
+  question-posted: "&aNew question posted"
+  question-blocked: "&cCannot post (active question/verifying/paused). Use /letmeask question force"
+  reload-dropped-verify: "&eDropped pending verification on reload"
+  reloaded: "&aConfig reloaded (base.yml & questions.yml)"
+  reloaded-empty: "&eConfig reloaded but question bank empty, kept old bank & config"
+  kick-verify-timeout: "Human verification timed out"
+  kick-chat-too-fast: "Chat interval too short"
+  kick-verify-failed: "Failed human verification"
+  announce-question: " §fNew question: §f{arg}"
+  announce-funded: " §aFunds restored. Balance: {arg}, about {arg2} more rewards."
+  announce-verify-timeout-kick: " §cPlayer {arg} kicked for verification timeout, round voided."
+  announce-verify-timeout: " §cVerification timed out, round voided."
+  announce-timeout: " §cNo one answered! Answer: §f{arg}"
+  announce-wrong: " §cWrong answer, try again!"
+  announce-chat-kick: " §cPlayer §f{arg} §ckicked for spamming."
+  announce-verify-start: " §cPlayer §f{arg} §c{arg2}, verification required..."
+  announce-verify-unavailable: " §cVerification service unavailable; this round's answer earns no reward."
+  announce-verify-failed: " §cPlayer §f{arg} §cfailed verification and was kicked."
+  announce-win-no-vault: " §aPlayer §f{arg} §aanswered correctly! §7(No Vault, no money reward)"
+  announce-win: " §aPlayer §f{arg} §aanswered correctly!"
+  announce-win-self: " §aPlayer §f{arg} §aanswered correctly! §7(Self-funded, no transfer)"
+  announce-win-reward: " §aPlayer §f{arg} §aanswered correctly, won §e{arg2}§a!"
+  announce-win-items: ", plus {arg}"
+  announce-paused-funds: " §cPaused: insufficient funds (need {arg}, have {arg2})."
+  announce-transfer-failed: " §cTransfer failed ({arg}), paused. Check console."
+  announce-refunded: " §cPayout failed, refunded. Contact staff. Error: {arg}"
+  announce-refund-failed: " §cPayout AND refund failed! Contact staff for manual compensation. Error: {arg}"
+  help-header: "&6&m----------&r &6LetMeAsk Help &6&m----------"
+  help-help: "&e/{cmd} help &7- Show this help"
+  help-top: "&e/{cmd} top [count] &7- Leaderboard (default 10, max 20)"
+  help-stats: "&e/{cmd} stats [player] &7- View stats (default self)"
+  help-status: "&e/{cmd} status &7- Plugin status"
+  help-admin-header: "&6Admin:"
+  help-start: "&e/{cmd} start &7- Start scheduler"
+  help-stop: "&e/{cmd} stop &7- Stop scheduler"
+  help-question: "&e/{cmd} question [force] &7- Post a question (force)"
+  help-reload: "&e/{cmd} reload &7- Reload config"
+  help-footer: "&6&m--------------------------------"
+  status-header: "&6LetMeAsk Status:"
+  status-task: " Scheduler: {arg}"
+  status-questions: " Questions: &f{arg}"
+  status-current: " Current: {arg}"
+  status-paused: " Paused (funds): {arg}"
+  status-verifying: " Verifying: {arg}"
+  status-total: " Asked: §f{arg} §7Answered: §f{arg2}"

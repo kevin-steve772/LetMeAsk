@@ -10,7 +10,7 @@
     <packaging>jar</packaging>
 
     <properties>
-        <revision>1.1.0</revision>
+        <revision>2.1.0</revision>
         <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
@@ -19,10 +19,15 @@
         <repository>
             <id>papermc</id>
             <url>https://repo.papermc.io/repository/maven-public/</url>
+            <!-- 校验和不匹配时直接失败，避免被篡改/损坏的构件进入构建 -->
+            <releases><checksumPolicy>fail</checksumPolicy></releases>
+            <snapshots><checksumPolicy>fail</checksumPolicy></snapshots>
         </repository>
         <repository>
             <id>central</id>
             <url>https://repo1.maven.org/maven2</url>
+            <releases><checksumPolicy>fail</checksumPolicy></releases>
+            <snapshots><checksumPolicy>fail</checksumPolicy></snapshots>
         </repository>
     </repositories>
 
@@ -38,6 +43,18 @@
             <artifactId>annotations</artifactId>
             <version>24.0.1</version>
             <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.bstats</groupId>
+            <artifactId>bstats-bukkit</artifactId>
+            <version>3.2.1</version>
+            <scope>compile</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.10.2</version>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 
@@ -72,6 +89,35 @@
                         <arg>-Xlint:unchecked</arg>
                     </compilerArgs>
                 </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <!-- bStats 指南给的 3.1.0 内置 ASM 太老，读不了 release 17 字节码，取新版 -->
+                <version>3.6.0</version>
+                <configuration>
+                    <createDependencyReducedPom>false</createDependencyReducedPom>
+                    <relocations>
+                        <!-- relocate 到自己的包，避免与其他插件的 bStats 冲突 -->
+                        <relocation>
+                            <pattern>org.bstats</pattern>
+                            <shadedPattern>com.cubex.quiz.libs.bstats</shadedPattern>
+                        </relocation>
+                    </relocations>
+                </configuration>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
         <finalName>${project.artifactId}-${revision}</finalName>

@@ -2,7 +2,7 @@ name: LetMeAsk
 main: com.cubex.quiz.QuizPlugin
 version: ${revision}
 api-version: "1.20"
-description: "在聊天栏出题的抢答活动插件（支持 Vault 经济，集成人机验证）"
+description: "多通道出题的抢答活动插件（支持 Vault 经济，集成人机验证）"
 authors:
   - Generated
 softdepend:
@@ -22,6 +22,11 @@ permissions:
   letmeask.use:
     description: "使用 LetMeAsk 查询命令（top/stats/status）"
     default: true
+  letmeask.stats.others:
+    description: "查看其他玩家的答题统计（不含他人查询时始终可查自己）"
+    default: true
   letmeask.admin:
     description: "管理 LetMeAsk 插件"
     default: op
+
+permission-message: "&c你没有权限使用该命令。"
